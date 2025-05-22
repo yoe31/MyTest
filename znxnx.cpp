@@ -5,14 +5,14 @@
 #include <sstream>
 #include <string>
 
-#include "clipper2/clipper.h" // Clipper2 include
+#include "clipper2/clipper.h" // Clipper2 include path
 #include <rapidjson/document.h>
 
 using namespace Clipper2Lib;
 
 constexpr double PI = 3.141592653589793;
 constexpr double EARTH_RADIUS = 6378137.0;
-constexpr double SCALE = 1e6; // for Clipper
+constexpr double SCALE = 1e6; // for Clipper2 integer scaling
 
 struct LatLon {
     double lat, lon;
@@ -33,9 +33,10 @@ void latlonToXY(double lat, double lon, double refLat, double refLon, double& x,
     y = EARTH_RADIUS * dLat;
 }
 
-// 사각형 범위 (전방 100m, 좌우 30m)
+// 차량 기준의 사각형 범위 (전방 100m, 좌우 30m)
 PathD makeSearchRect(double heading_deg) {
     double theta = heading_deg * PI / 180.0;
+
     double dx_front = 100.0 * std::cos(theta);
     double dy_front = 100.0 * std::sin(theta);
     double dx_back  = -100.0 * std::cos(theta);
@@ -54,12 +55,16 @@ PathD makeSearchRect(double heading_deg) {
     return rect;
 }
 
-// GeoJSON 로딩
+// GeoJSON 파싱: Link 리스트 추출
 std::vector<Link> loadLinks(const std::string& path) {
     std::ifstream ifs(path);
+    if (!ifs.is_open()) {
+        std::cerr << "Cannot open file: " << path << std::endl;
+        return {};
+    }
+
     std::stringstream buffer;
     buffer << ifs.rdbuf();
-
     rapidjson::Document doc;
     doc.Parse(buffer.str().c_str());
 
@@ -83,14 +88,11 @@ std::vector<Link> loadLinks(const std::string& path) {
     return links;
 }
 
-// 자르기 및 결과 반환
+// 클리핑 수행
 std::vector<PathD> clipLinks(const std::vector<Link>& links,
                              double refLat, double refLon,
                              const PathD& searchRect) {
     PathsD result;
-
-    ClipperD clipper;
-    clipper.AddClip(searchRect * SCALE, ptSubject, false);
 
     for (const auto& link : links) {
         PathD path;
@@ -102,14 +104,15 @@ std::vector<PathD> clipLinks(const std::vector<Link>& links,
 
         if (path.size() < 2) continue;
 
+        ClipperD clipper;
+        clipper.AddSubject(path * SCALE);
+        clipper.AddClip(searchRect * SCALE, PathType::ptClip);
+
         PathsD clipped;
-        clipper.Clear();
-        clipper.AddClip(searchRect * SCALE, ptClip);
-        clipper.AddSubject(path * SCALE, ptSubject, false);
         clipper.Execute(ClipType::ctIntersection, FillRule::NonZero, clipped);
 
         for (const auto& p : clipped) {
-            result.push_back(p / SCALE); // scale back
+            result.push_back(p / SCALE); // 정수 → 실수 좌표 복원
         }
     }
 
@@ -118,14 +121,22 @@ std::vector<PathD> clipLinks(const std::vector<Link>& links,
 
 int main() {
     std::string geojsonFile = "links.geojson";
+
+    // 테스트용 GPS 입력 (서울 시청 기준)
     double gpsLat = 37.5665;
     double gpsLon = 126.9780;
-    double heading = 0.0;
+    double heading = 0.0; // 북쪽
 
+    // 링크 로딩
     auto links = loadLinks(geojsonFile);
+
+    // 범위 사각형 생성
     auto searchRect = makeSearchRect(heading);
+
+    // 클리핑 수행
     auto clipped = clipLinks(links, gpsLat, gpsLon, searchRect);
 
+    // 출력
     std::cout << "Clipped Link Segments:\n";
     for (const auto& path : clipped) {
         std::cout << "Segment:\n";
