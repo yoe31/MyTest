@@ -1,50 +1,99 @@
-import json
+#include <GL/glut.h>
+#include <math.h>
 
-def load_geojson(filepath):
-    with open(filepath, 'r', encoding='utf-8') as f:
-        return json.load(f)
+#define PI 3.14159265f
 
-def save_geojson(data, filepath):
-    with open(filepath, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+void draw_arrow(float x, float y, float angle_rad) {
+    float length = 1.0f;
+    float arrow_width = 0.3f;
 
-def extract_id_pairs_from_A(features_A):
-    # A에서 NODE_ID, NODE_MAP_I를 정수로 추출
-    return set(
-        (feature['properties'].get('NODE_ID'), feature['properties'].get('NODE_MAP_I'))
-        for feature in features_A
-        if isinstance(feature['properties'].get('NODE_ID'), int) and isinstance(feature['properties'].get('NODE_MAP_I'), int)
-    )
+    // 화살표 끝점
+    float tip_x = x + length * cosf(angle_rad);
+    float tip_y = y + length * sinf(angle_rad);
 
-def filter_B_by_A(B_features, id_pair_set):
-    # B에서 정수로 변환 후 A에 있는 항목만 필터링
-    filtered = []
-    for feature in B_features:
-        props = feature.get('properties', {})
-        try:
-            node_id = int(props.get('NODE_ID'))
-            node_map_i = int(props.get('NODE_MAP_I'))
-        except (TypeError, ValueError):
-            continue  # 변환 불가시 무시
+    // 좌우 날개
+    float left_x = x + arrow_width * cosf(angle_rad + 5.0f * PI / 6.0f);
+    float left_y = y + arrow_width * sinf(angle_rad + 5.0f * PI / 6.0f);
 
-        if (node_id, node_map_i) in id_pair_set:
-            filtered.append(feature)
-    return filtered
+    float right_x = x + arrow_width * cosf(angle_rad - 5.0f * PI / 6.0f);
+    float right_y = y + arrow_width * sinf(angle_rad - 5.0f * PI / 6.0f);
 
-def main():
-    A_geojson = load_geojson('A.geojson')
-    B_geojson = load_geojson('B.geojson')
+    glBegin(GL_TRIANGLES);
+    glVertex2f(tip_x, tip_y);
+    glVertex2f(left_x, left_y);
+    glVertex2f(right_x, right_y);
+    glEnd();
+}
 
-    id_pairs = extract_id_pairs_from_A(A_geojson['features'])
-    filtered_B_features = filter_B_by_A(B_geojson['features'], id_pairs)
+// 직진 화살표
+void draw_arrow_straight(float x0, float y0, float x1, float y1) {
+    float dx = x1 - x0;
+    float dy = y1 - y0;
+    float angle = atan2f(dy, dx);
 
-    result = {
-        "type": "FeatureCollection",
-        "features": filtered_B_features
-    }
+    float base_x = x1 - cosf(angle); // 1m 뒤
+    float base_y = y1 - sinf(angle);
+    draw_arrow(base_x, base_y, angle);
+}
 
-    save_geojson(result, 'B_filtered.geojson')
-    print(f"필터링된 항목 개수: {len(filtered_B_features)}개")
+// 좌회전 화살표
+void draw_arrow_left(float x0, float y0, float x1, float y1) {
+    float dx = x1 - x0;
+    float dy = y1 - y0;
+    float angle = atan2f(dy, dx) + PI / 2.0f; // +90도 회전
 
-if __name__ == '__main__':
-    main()
+    float base_x = x1 - cosf(angle);
+    float base_y = y1 - sinf(angle);
+    draw_arrow(base_x, base_y, angle);
+}
+
+// 우회전 화살표
+void draw_arrow_right(float x0, float y0, float x1, float y1) {
+    float dx = x1 - x0;
+    float dy = y1 - y0;
+    float angle = atan2f(dy, dx) - PI / 2.0f; // -90도 회전
+
+    float base_x = x1 - cosf(angle);
+    float base_y = y1 - sinf(angle);
+    draw_arrow(base_x, base_y, angle);
+}
+
+// 예시 렌더링 코드
+void display() {
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    float x0 = 0.0f, y0 = 0.0f;
+    float x1 = 3.0f, y1 = 0.0f;
+
+    glColor3f(1.0, 1.0, 1.0);
+    glBegin(GL_LINES);
+    glVertex2f(x0, y0);
+    glVertex2f(x1, y1);
+    glEnd();
+
+    glColor3f(1.0, 0.0, 0.0);
+    draw_arrow_straight(x0, y0, x1, y1);
+
+    glColor3f(0.0, 1.0, 0.0);
+    draw_arrow_left(x0, y0, x1, y1);
+
+    glColor3f(0.0, 0.0, 1.0);
+    draw_arrow_right(x0, y0, x1, y1);
+
+    glFlush();
+}
+
+void init() {
+    glClearColor(0.0, 0.0, 0.0, 1.0);
+    gluOrtho2D(-5, 5, -5, 5);
+}
+
+int main(int argc, char** argv) {
+    glutInit(&argc, argv);
+    glutInitWindowSize(600, 600);
+    glutCreateWindow("Arrow Drawing");
+    init();
+    glutDisplayFunc(display);
+    glutMainLoop();
+    return 0;
+}
