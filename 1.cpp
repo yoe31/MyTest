@@ -1,89 +1,64 @@
-#include <stdio.h>
-#include <math.h>
-
-#define MAX_POINTS 1000
-#define OFFSET 3.5
-#define TARGET_LENGTH 80.0
+#define MAX_OBJ 40
+#define MAX_HISTORY 10000
 
 typedef struct {
-    double x, y;
-} Point;
+    double timestamp;
+    double lat, lon, heading;  // deg
+    float posX, posY, posTheta;
+} DR_t;
 
-double distance(Point a, Point b) {
-    return hypot(b.x - a.x, b.y - a.y);
+typedef struct {
+    uint32_t obj_id;
+    uint8_t moving_status;
+    uint8_t confidence;
+    float update_age;
+    uint8_t obj_type;
+    float x;  // 자차 기준
+    float y;
+    float heading_deg;
+    float velocity;
+    float width;
+    float length;
+} Object_t;
+
+typedef struct {
+    double timestamp;
+    uint32_t obj_id;
+    float global_x;
+    float global_y;
+    float heading_deg;
+} TrajectoryPoint_t;
+
+TrajectoryPoint_t traj_history[MAX_OBJ][MAX_HISTORY];
+int traj_length[MAX_OBJ] = {0};
+
+// 자차 기준 좌표 → 전역 좌표 변환 (단순 변환 예시)
+void transform_to_global(const DR_t* dr, float local_x, float local_y, float* out_x, float* out_y) {
+    float theta = dr->heading * M_PI / 180.0;  // Heading은 CW 기준
+    *out_x = dr->posX + local_x * cos(theta) - local_y * sin(theta);
+    *out_y = dr->posY + local_x * sin(theta) + local_y * cos(theta);
 }
 
-// 선분 a→b를 오른쪽으로 OFFSET 평행 이동한 점 반환
-void offset_segment(Point a, Point b, double offset, Point* a_out, Point* b_out) {
-    double dx = b.x - a.x;
-    double dy = b.y - a.y;
-    double length = hypot(dx, dy);
-    double nx = -dy / length;
-    double ny = dx / length;
+// 유효 객체만 필터링 및 궤적 저장
+void process_objects(const DR_t* dr, const Object_t* objs, int num_obj) {
+    for (int i = 0; i < num_obj; ++i) {
+        if (objs[i].confidence < 70) continue;
+        if (objs[i].obj_type == 2 || objs[i].obj_type == 3 || objs[i].obj_type == 4 || objs[i].obj_type == 8) continue;
 
-    a_out->x = a.x + nx * offset;
-    a_out->y = a.y + ny * offset;
-    b_out->x = b.x + nx * offset;
-    b_out->y = b.y + ny * offset;
-}
+        uint32_t id = objs[i].obj_id;
+        if (id >= MAX_OBJ) continue;
 
-int make_offset_path(Point* input, int input_len, Point* output, int* output_len) {
-    double total_len = 0.0;
-    int out_idx = 0;
+        float gx, gy;
+        transform_to_global(dr, objs[i].x, objs[i].y, &gx, &gy);
 
-    for (int i = 0; i < input_len - 1; ++i) {
-        Point a = input[i];
-        Point b = input[i + 1];
-        double seg_len = distance(a, b);
-
-        if (total_len + seg_len > TARGET_LENGTH) {
-            double remain = TARGET_LENGTH - total_len;
-            double ratio = remain / seg_len;
-
-            Point mid = {
-                a.x + (b.x - a.x) * ratio,
-                a.y + (b.y - a.y) * ratio
-            };
-
-            Point oa, ob;
-            offset_segment(a, mid, OFFSET, &oa, &ob);
-
-            if (out_idx == 0) output[out_idx++] = oa;
-            output[out_idx++] = ob;
-
-            *output_len = out_idx;
-            return 0;
-        } else {
-            Point oa, ob;
-            offset_segment(a, b, OFFSET, &oa, &ob);
-            if (out_idx == 0) output[out_idx++] = oa;
-            output[out_idx++] = ob;
-
-            total_len += seg_len;
+        int len = traj_length[id];
+        if (len < MAX_HISTORY) {
+            traj_history[id][len].timestamp = dr->timestamp;
+            traj_history[id][len].obj_id = id;
+            traj_history[id][len].global_x = gx;
+            traj_history[id][len].global_y = gy;
+            traj_history[id][len].heading_deg = objs[i].heading_deg;
+            traj_length[id]++;
         }
     }
-
-    *output_len = out_idx;
-    return 0;
-}
-
-void print_points(Point* pts, int len) {
-    for (int i = 0; i < len; ++i) {
-        printf("%.3f, %.3f\n", pts[i].x, pts[i].y);
-    }
-}
-
-int main() {
-    Point input[] = {
-        {0, 0}, {40, 0}, {80, 20}, {120, 20}
-    };
-    int input_len = sizeof(input) / sizeof(Point);
-
-    Point output[MAX_POINTS];
-    int output_len = 0;
-
-    make_offset_path(input, input_len, output, &output_len);
-    print_points(output, output_len);
-
-    return 0;
 }
