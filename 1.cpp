@@ -1,64 +1,92 @@
-#define MAX_OBJ 40
-#define MAX_HISTORY 10000
+#define MAX_TRAJECTORIES 100
 
 typedef struct {
-    double timestamp;
-    double lat, lon, heading;  // deg
-    float posX, posY, posTheta;
-} DR_t;
+    uint32_t obj_id;  // 객체 ID
+    int active;       // 1: 유효, 0: 삭제됨
+    int miss_count;
+    double last_timestamp;
+    TrajectoryPoint_t points[MAX_HISTORY];
+    int length;
+} Trajectory_t;
 
-typedef struct {
-    uint32_t obj_id;
-    uint8_t moving_status;
-    uint8_t confidence;
-    float update_age;
-    uint8_t obj_type;
-    float x;  // 자차 기준
-    float y;
-    float heading_deg;
-    float velocity;
-    float width;
-    float length;
-} Object_t;
+Trajectory_t trajectories[MAX_TRAJECTORIES];
+int num_trajectories = 0;
 
-typedef struct {
-    double timestamp;
-    uint32_t obj_id;
-    float global_x;
-    float global_y;
-    float heading_deg;
-} TrajectoryPoint_t;
-
-TrajectoryPoint_t traj_history[MAX_OBJ][MAX_HISTORY];
-int traj_length[MAX_OBJ] = {0};
-
-// 자차 기준 좌표 → 전역 좌표 변환 (단순 변환 예시)
-void transform_to_global(const DR_t* dr, float local_x, float local_y, float* out_x, float* out_y) {
-    float theta = dr->heading * M_PI / 180.0;  // Heading은 CW 기준
-    *out_x = dr->posX + local_x * cos(theta) - local_y * sin(theta);
-    *out_y = dr->posY + local_x * sin(theta) + local_y * cos(theta);
+int find_trajectory_index(uint32_t obj_id) {
+    for (int i = 0; i < num_trajectories; ++i) {
+        if (trajectories[i].obj_id == obj_id && trajectories[i].active)
+            return i;
+    }
+    return -1;  // 없음
 }
 
-// 유효 객체만 필터링 및 궤적 저장
+int create_trajectory(uint32_t obj_id, double timestamp) {
+    if (num_trajectories >= MAX_TRAJECTORIES)
+        return -1;  // 초과
+
+    trajectories[num_trajectories].obj_id = obj_id;
+    trajectories[num_trajectories].active = 1;
+    trajectories[num_trajectories].miss_count = 0;
+    trajectories[num_trajectories].last_timestamp = timestamp;
+    trajectories[num_trajectories].length = 0;
+    return num_trajectories++;
+}
+
 void process_objects(const DR_t* dr, const Object_t* objs, int num_obj) {
+    int found_indices[MAX_TRAJECTORIES] = {0};
+
     for (int i = 0; i < num_obj; ++i) {
         if (objs[i].confidence < 70) continue;
         if (objs[i].obj_type == 2 || objs[i].obj_type == 3 || objs[i].obj_type == 4 || objs[i].obj_type == 8) continue;
 
-        uint32_t id = objs[i].obj_id;
-        if (id >= MAX_OBJ) continue;
+        uint32_t obj_id = objs[i].obj_id;
+
+        int idx = find_trajectory_index(obj_id);
+        if (idx == -1) {
+            idx = create_trajectory(obj_id, dr->timestamp);
+            if (idx == -1) continue;  // 용량 초과
+        }
+
+        found_indices[idx] = 1;
+        trajectories[idx].miss_count = 0;
+        trajectories[idx].last_timestamp = dr->timestamp;
 
         float gx, gy;
         transform_to_global(dr, objs[i].x, objs[i].y, &gx, &gy);
 
-        int len = traj_length[id];
+        int len = trajectories[idx].length;
         if (len < MAX_HISTORY) {
-            traj_history[id][len].timestamp = dr->timestamp;
-            traj_history[id][len].obj_id = id;
-            traj_history[id][len].global_x = gx;
-            traj_history[id][len].global_y = gy;
-            traj_history[id][len].heading_deg = objs[i].heading_deg;
-            traj_length[id]++;
+            trajectories[idx].points[len].timestamp = dr->timestamp;
+            trajectories[idx].points[len].obj_id = obj_id;
+            trajectories[idx].points[len].global_x = gx;
+            trajectories[idx].points[len].global_y = gy;
+            trajectories[idx].points[len].heading_deg = objs[i].heading_deg;
+            trajectories[idx].length++;
+        }
+    }
+
+    // === 인식되지 않은 객체 처리 ===
+    for (int i = 0; i < num_trajectories; ++i) {
+        if (!trajectories[i].active) continue;
+        if (found_indices[i]) continue;
+
+        trajectories[i].miss_count++;
+
+        if (trajectories[i].length > 0) {
+            TrajectoryPoint_t* last = &trajectories[i].points[trajectories[i].length - 1];
+            float lx = last->global_x - dr->posX;
+            float ly = last->global_y - dr->posY;
+
+            if (is_out_of_range(dr, lx, ly)) {
+                trajectories[i].active = 0;
+                trajectories[i].length = 0;
+                continue;
+            }
+        }
+
+        if (trajectories[i].miss_count >= MAX_MISS_COUNT) {
+            trajectories[i].active = 0;
+            trajectories[i].length = 0;
         }
     }
 }
