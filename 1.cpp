@@ -1,92 +1,194 @@
+#include <stdio.h>
+#include <math.h>
+#include <string.h>
+
 #define MAX_TRAJECTORIES 100
+#define MAX_HISTORY 10000
+#define MAX_CLUSTER 50
 
 typedef struct {
-    uint32_t obj_id;  // 객체 ID
-    int active;       // 1: 유효, 0: 삭제됨
+    double timestamp;
+    uint32_t obj_id;
+    float global_x;
+    float global_y;
+    float heading_deg;
+    float velocity; // optional
+} TrajectoryPoint_t;
+
+typedef struct {
+    uint32_t obj_id;
+    int active;
     int miss_count;
     double last_timestamp;
     TrajectoryPoint_t points[MAX_HISTORY];
     int length;
 } Trajectory_t;
 
+typedef struct {
+    float mean_x, mean_y;
+    float mean_heading;
+    float mean_velocity;
+    int traj_index;
+} TrajFeature_t;
+
+typedef enum {
+    ROAD_CITY,
+    ROAD_HIGHWAY
+} RoadType;
+
+typedef struct {
+    float max_heading_diff;
+    float max_lateral_dist;
+    float max_velocity_diff;
+} MergeThresholds;
+
 Trajectory_t trajectories[MAX_TRAJECTORIES];
 int num_trajectories = 0;
 
-int find_trajectory_index(uint32_t obj_id) {
-    for (int i = 0; i < num_trajectories; ++i) {
-        if (trajectories[i].obj_id == obj_id && trajectories[i].active)
-            return i;
+TrajFeature_t features[MAX_TRAJECTORIES];
+int cluster_id[MAX_TRAJECTORIES];  // -1로 초기화 필요
+
+// === [1] 고속도로/도심 병합 기준 설정 ===
+MergeThresholds get_thresholds(RoadType type) {
+    MergeThresholds t;
+    if (type == ROAD_HIGHWAY) {
+        t.max_heading_diff = 10.0f;
+        t.max_lateral_dist = 1.5f;
+        t.max_velocity_diff = 3.0f;
+    } else {
+        t.max_heading_diff = 15.0f;
+        t.max_lateral_dist = 2.0f;
+        t.max_velocity_diff = 5.0f;
     }
-    return -1;  // 없음
+    return t;
 }
 
-int create_trajectory(uint32_t obj_id, double timestamp) {
-    if (num_trajectories >= MAX_TRAJECTORIES)
-        return -1;  // 초과
+// === [2] 궤적에서 특징 추출 ===
+void compute_features() {
+    for (int i = 0; i < num_trajectories; ++i) {
+        Trajectory_t* traj = &trajectories[i];
+        if (!traj->active || traj->length < 2) continue;
 
-    trajectories[num_trajectories].obj_id = obj_id;
-    trajectories[num_trajectories].active = 1;
-    trajectories[num_trajectories].miss_count = 0;
-    trajectories[num_trajectories].last_timestamp = timestamp;
-    trajectories[num_trajectories].length = 0;
-    return num_trajectories++;
-}
-
-void process_objects(const DR_t* dr, const Object_t* objs, int num_obj) {
-    int found_indices[MAX_TRAJECTORIES] = {0};
-
-    for (int i = 0; i < num_obj; ++i) {
-        if (objs[i].confidence < 70) continue;
-        if (objs[i].obj_type == 2 || objs[i].obj_type == 3 || objs[i].obj_type == 4 || objs[i].obj_type == 8) continue;
-
-        uint32_t obj_id = objs[i].obj_id;
-
-        int idx = find_trajectory_index(obj_id);
-        if (idx == -1) {
-            idx = create_trajectory(obj_id, dr->timestamp);
-            if (idx == -1) continue;  // 용량 초과
+        float sum_x = 0, sum_y = 0, sum_h = 0, sum_v = 0;
+        for (int j = 0; j < traj->length; ++j) {
+            sum_x += traj->points[j].global_x;
+            sum_y += traj->points[j].global_y;
+            sum_h += traj->points[j].heading_deg;
+            sum_v += traj->points[j].velocity;
         }
 
-        found_indices[idx] = 1;
-        trajectories[idx].miss_count = 0;
-        trajectories[idx].last_timestamp = dr->timestamp;
+        features[i].mean_x = sum_x / traj->length;
+        features[i].mean_y = sum_y / traj->length;
+        features[i].mean_heading = sum_h / traj->length;
+        features[i].mean_velocity = sum_v / traj->length;
+        features[i].traj_index = i;
+    }
+}
 
-        float gx, gy;
-        transform_to_global(dr, objs[i].x, objs[i].y, &gx, &gy);
+// === [3] 차선 변경 감지 ===
+int is_lane_change(const Trajectory_t* traj) {
+    if (traj->length < 3) return 0;
 
-        int len = trajectories[idx].length;
-        if (len < MAX_HISTORY) {
-            trajectories[idx].points[len].timestamp = dr->timestamp;
-            trajectories[idx].points[len].obj_id = obj_id;
-            trajectories[idx].points[len].global_x = gx;
-            trajectories[idx].points[len].global_y = gy;
-            trajectories[idx].points[len].heading_deg = objs[i].heading_deg;
-            trajectories[idx].length++;
+    for (int i = 2; i < traj->length; ++i) {
+        float y1 = traj->points[i - 2].global_y;
+        float y2 = traj->points[i].global_y;
+        float dy = fabs(y2 - y1);
+
+        float h1 = traj->points[i - 2].heading_deg;
+        float h2 = traj->points[i].heading_deg;
+        float dh = fabs(h2 - h1);
+        if (dh > 180) dh = 360 - dh;
+
+        if (dy > 2.5 || dh > 15.0) {
+            return 1;
         }
     }
 
-    // === 인식되지 않은 객체 처리 ===
+    return 0;
+}
+
+// === [4] 유사 궤적 판단 ===
+int is_similar_trajectory(
+    const TrajFeature_t* a, const TrajFeature_t* b,
+    MergeThresholds t
+) {
+    float dx = a->mean_x - b->mean_x;
+    float dy = a->mean_y - b->mean_y;
+    float dist = sqrt(dx * dx + dy * dy);
+
+    float dh = fabs(a->mean_heading - b->mean_heading);
+    if (dh > 180) dh = 360 - dh;
+
+    float dv = fabs(a->mean_velocity - b->mean_velocity);
+
+    return (dist < t.max_lateral_dist &&
+            dh < t.max_heading_diff &&
+            dv < t.max_velocity_diff);
+}
+
+// === [5] 병합 (클러스터 ID 설정) ===
+int merge_trajectories(RoadType road_type) {
+    MergeThresholds t = get_thresholds(road_type);
+    int cluster_count = 0;
+
     for (int i = 0; i < num_trajectories; ++i) {
-        if (!trajectories[i].active) continue;
-        if (found_indices[i]) continue;
+        cluster_id[i] = -1;
+    }
 
-        trajectories[i].miss_count++;
+    for (int i = 0; i < num_trajectories; ++i) {
+        if (!trajectories[i].active || is_lane_change(&trajectories[i]))
+            continue;
 
-        if (trajectories[i].length > 0) {
-            TrajectoryPoint_t* last = &trajectories[i].points[trajectories[i].length - 1];
-            float lx = last->global_x - dr->posX;
-            float ly = last->global_y - dr->posY;
+        if (cluster_id[i] != -1) continue;
+        cluster_id[i] = cluster_count;
 
-            if (is_out_of_range(dr, lx, ly)) {
-                trajectories[i].active = 0;
-                trajectories[i].length = 0;
+        for (int j = i + 1; j < num_trajectories; ++j) {
+            if (!trajectories[j].active || is_lane_change(&trajectories[j]))
                 continue;
+            if (cluster_id[j] != -1) continue;
+
+            if (is_similar_trajectory(&features[i], &features[j], t)) {
+                cluster_id[j] = cluster_count;
             }
         }
 
-        if (trajectories[i].miss_count >= MAX_MISS_COUNT) {
-            trajectories[i].active = 0;
-            trajectories[i].length = 0;
+        cluster_count++;
+    }
+
+    return cluster_count;
+}
+
+// === [6] 대표 중심선 계산 ===
+void print_representative_trajectories(int total_clusters) {
+    for (int cid = 0; cid < total_clusters; ++cid) {
+        printf("Cluster %d: Center line (x, y):\n", cid);
+
+        // 평균 길이보다 짧은 건 패스
+        float sum_x[MAX_HISTORY] = {0};
+        float sum_y[MAX_HISTORY] = {0};
+        int count[MAX_HISTORY] = {0};
+        int max_len = 0;
+
+        for (int i = 0; i < num_trajectories; ++i) {
+            if (cluster_id[i] != cid) continue;
+
+            Trajectory_t* traj = &trajectories[i];
+            if (traj->length > max_len) max_len = traj->length;
+
+            for (int j = 0; j < traj->length; ++j) {
+                sum_x[j] += traj->points[j].global_x;
+                sum_y[j] += traj->points[j].global_y;
+                count[j]++;
+            }
         }
+
+        for (int j = 0; j < max_len; ++j) {
+            if (count[j] > 0) {
+                float avg_x = sum_x[j] / count[j];
+                float avg_y = sum_y[j] / count[j];
+                printf("    %.2f, %.2f\n", avg_x, avg_y);
+            }
+        }
+        printf("\n");
     }
 }
