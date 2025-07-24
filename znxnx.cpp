@@ -1,149 +1,121 @@
-#include <iostream>
-#include <fstream>
-#include <vector>
-#include <cmath>
-#include <sstream>
-#include <string>
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <time.h>
 
-#include "clipper2/clipper.h" // Clipper2 include path
-#include <rapidjson/document.h>
+#define MAX_POINTS 1000
+#define MAX_ITER 1000
+#define THRESHOLD 1.0
 
-using namespace Clipper2Lib;
+typedef struct {
+    double x;
+    double y;
+} Point;
 
-constexpr double PI = 3.141592653589793;
-constexpr double EARTH_RADIUS = 6378137.0;
-constexpr double SCALE = 1e6; // for Clipper2 integer scaling
+typedef struct {
+    double a, b, c; // x = a*y^2 + b*y + c
+} QuadModel;
 
-struct LatLon {
-    double lat, lon;
-};
+// 3개의 점으로부터 2차 방정식 피팅
+int fit_quadratic_model(Point p1, Point p2, Point p3, QuadModel* model) {
+    double A[3][4] = {
+        {p1.y * p1.y, p1.y, 1.0, p1.x},
+        {p2.y * p2.y, p2.y, 1.0, p2.x},
+        {p3.y * p3.y, p3.y, 1.0, p3.x}
+    };
 
-struct Link {
-    int id;
-    std::vector<LatLon> coords;
-};
+    // 가우스 소거법으로 a, b, c 구하기
+    for (int i = 0; i < 3; i++) {
+        // 피벗이 너무 작으면 실패
+        if (fabs(A[i][i]) < 1e-6) return 0;
 
-// 위경도 -> XY (로컬 평면) 변환
-void latlonToXY(double lat, double lon, double refLat, double refLon, double& x, double& y) {
-    double dLat = (lat - refLat) * PI / 180.0;
-    double dLon = (lon - refLon) * PI / 180.0;
-    double refLatRad = refLat * PI / 180.0;
-
-    x = EARTH_RADIUS * dLon * std::cos(refLatRad);
-    y = EARTH_RADIUS * dLat;
-}
-
-// 차량 기준의 사각형 범위 (전방 100m, 좌우 30m)
-PathD makeSearchRect(double heading_deg) {
-    double theta = heading_deg * PI / 180.0;
-
-    double dx_front = 100.0 * std::cos(theta);
-    double dy_front = 100.0 * std::sin(theta);
-    double dx_back  = -100.0 * std::cos(theta);
-    double dy_back  = -100.0 * std::sin(theta);
-
-    double dx_left  = -30.0 * std::sin(theta);
-    double dy_left  =  30.0 * std::cos(theta);
-    double dx_right =  30.0 * std::sin(theta);
-    double dy_right = -30.0 * std::cos(theta);
-
-    PathD rect(4);
-    rect[0] = PointD(dx_back + dx_left, dy_back + dy_left);
-    rect[1] = PointD(dx_back + dx_right, dy_back + dy_right);
-    rect[2] = PointD(dx_front + dx_right, dy_front + dy_right);
-    rect[3] = PointD(dx_front + dx_left, dy_front + dy_left);
-    return rect;
-}
-
-// GeoJSON 파싱: Link 리스트 추출
-std::vector<Link> loadLinks(const std::string& path) {
-    std::ifstream ifs(path);
-    if (!ifs.is_open()) {
-        std::cerr << "Cannot open file: " << path << std::endl;
-        return {};
+        for (int j = i + 1; j < 3; j++) {
+            double r = A[j][i] / A[i][i];
+            for (int k = i; k < 4; k++) {
+                A[j][k] -= r * A[i][k];
+            }
+        }
     }
 
-    std::stringstream buffer;
-    buffer << ifs.rdbuf();
-    rapidjson::Document doc;
-    doc.Parse(buffer.str().c_str());
+    // 역연산
+    double x[3];
+    for (int i = 2; i >= 0; i--) {
+        x[i] = A[i][3];
+        for (int j = i + 1; j < 3; j++) {
+            x[i] -= A[i][j] * x[j];
+        }
+        x[i] /= A[i][i];
+    }
 
-    std::vector<Link> links;
-    for (auto& feature : doc["features"].GetArray()) {
-        Link link;
-        link.id = feature["properties"]["id"].GetInt();
-        auto& coords = feature["geometry"]["coordinates"];
+    model->a = x[0];
+    model->b = x[1];
+    model->c = x[2];
+    return 1;
+}
 
-        for (auto& line : coords.GetArray()) {
-            for (auto& point : line.GetArray()) {
-                double lon = point[0].GetDouble();
-                double lat = point[1].GetDouble();
-                link.coords.push_back({ lat, lon });
+// 예측 x값 계산
+double predict_x(QuadModel model, double y) {
+    return model.a * y * y + model.b * y + model.c;
+}
+
+// RANSAC 핵심 로직
+void ransac_quadratic(Point* points, int num_points, QuadModel* best_model, int* best_inliers, int* best_inlier_count) {
+    int max_inliers = 0;
+    srand(time(NULL));
+
+    for (int iter = 0; iter < MAX_ITER; iter++) {
+        // 서로 다른 3개 점 선택
+        int i1 = rand() % num_points;
+        int i2, i3;
+        do { i2 = rand() % num_points; } while (i2 == i1);
+        do { i3 = rand() % num_points; } while (i3 == i1 || i3 == i2);
+
+        QuadModel model;
+        if (!fit_quadratic_model(points[i1], points[i2], points[i3], &model)) continue;
+
+        int inliers[MAX_POINTS];
+        int inlier_count = 0;
+
+        for (int i = 0; i < num_points; i++) {
+            double x_pred = predict_x(model, points[i].y);
+            double error = fabs(x_pred - points[i].x);
+            if (error < THRESHOLD) {
+                inliers[inlier_count++] = i;
             }
         }
 
-        links.push_back(link);
-    }
-
-    return links;
-}
-
-// 클리핑 수행
-std::vector<PathD> clipLinks(const std::vector<Link>& links,
-                             double refLat, double refLon,
-                             const PathD& searchRect) {
-    PathsD result;
-
-    for (const auto& link : links) {
-        PathD path;
-        for (auto& ll : link.coords) {
-            double x, y;
-            latlonToXY(ll.lat, ll.lon, refLat, refLon, x, y);
-            path.emplace_back(x, y);
-        }
-
-        if (path.size() < 2) continue;
-
-        ClipperD clipper;
-        clipper.AddSubject(path * SCALE);
-        clipper.AddClip(searchRect * SCALE, PathType::ptClip);
-
-        PathsD clipped;
-        clipper.Execute(ClipType::ctIntersection, FillRule::NonZero, clipped);
-
-        for (const auto& p : clipped) {
-            result.push_back(p / SCALE); // 정수 → 실수 좌표 복원
+        if (inlier_count > max_inliers) {
+            *best_model = model;
+            *best_inlier_count = inlier_count;
+            for (int k = 0; k < inlier_count; k++) {
+                best_inliers[k] = inliers[k];
+            }
+            max_inliers = inlier_count;
         }
     }
-
-    return result;
 }
 
+// 예제 main
 int main() {
-    std::string geojsonFile = "links.geojson";
+    Point points[MAX_POINTS] = {
+        {0, 0}, {1, 1}, {4, 2}, {9, 3}, {16, 4},
+        {25, 5}, {36, 6}, {49, 7}, {64, 8}, {81, 9}, // 대략 x = y^2
+        {50, -2}, {60, -3} // outlier
+    };
+    int num_points = 12;
 
-    // 테스트용 GPS 입력 (서울 시청 기준)
-    double gpsLat = 37.5665;
-    double gpsLon = 126.9780;
-    double heading = 0.0; // 북쪽
+    QuadModel best_model;
+    int best_inliers[MAX_POINTS];
+    int best_inlier_count = 0;
 
-    // 링크 로딩
-    auto links = loadLinks(geojsonFile);
+    ransac_quadratic(points, num_points, &best_model, best_inliers, &best_inlier_count);
 
-    // 범위 사각형 생성
-    auto searchRect = makeSearchRect(heading);
-
-    // 클리핑 수행
-    auto clipped = clipLinks(links, gpsLat, gpsLon, searchRect);
-
-    // 출력
-    std::cout << "Clipped Link Segments:\n";
-    for (const auto& path : clipped) {
-        std::cout << "Segment:\n";
-        for (const auto& pt : path) {
-            std::cout << "  " << pt.x << ", " << pt.y << "\n";
-        }
+    printf("Best model: x = %.3f * y^2 + %.3f * y + %.3f\n", best_model.a, best_model.b, best_model.c);
+    printf("Inliers (%d): ", best_inlier_count);
+    for (int i = 0; i < best_inlier_count; i++) {
+        printf("%d ", best_inliers[i]);
     }
+    printf("\n");
 
     return 0;
 }
