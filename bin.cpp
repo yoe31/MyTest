@@ -1,145 +1,106 @@
-#include "map_data.hpp"
-#include <nlohmann/json.hpp>
-#include <fstream>
-#include <iostream>
-#include <zlib.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
 
-using json = nlohmann::json;
+#define UNCLASSIFIED -1
+#define NOISE -2
+#define MAX_POINTS 1000  // 필요시 조정
 
-// vector<char>에 바이너리 데이터 쓰기
-void write_to_buffer(std::vector<char>& buffer, const void* data, size_t size) {
-    const char* cdata = reinterpret_cast<const char*>(data);
-    buffer.insert(buffer.end(), cdata, cdata + size);
+typedef struct {
+    double x, y;
+    int cluster_id;
+} Point;
+
+int minPts = 3;
+double eps = 2.0;
+
+double distance(Point* a, Point* b) {
+    double dx = a->x - b->x;
+    double dy = a->y - b->y;
+    return sqrt(dx * dx + dy * dy);
 }
 
-// 문자열 저장 (길이 + 내용)
-void write_string(std::vector<char>& buffer, const std::string& str) {
-    size_t len = str.size();
-    write_to_buffer(buffer, &len, sizeof(size_t));
-    write_to_buffer(buffer, str.data(), len);
+int regionQuery(Point* points, int num_points, int index, int* neighbors) {
+    int count = 0;
+    for (int i = 0; i < num_points; ++i) {
+        if (distance(&points[index], &points[i]) <= eps) {
+            neighbors[count++] = i;
+        }
+    }
+    return count;
 }
 
-void convert_geojson_to_bin(const std::string& geojson_file, const std::string& bin_file) {
-    std::ifstream in(geojson_file);
-    if (!in) {
-        std::cerr << "Cannot open " << geojson_file << std::endl;
-        return;
+int expandCluster(Point* points, int num_points, int index, int cluster_id) {
+    int neighbors[MAX_POINTS];
+    int neighbor_count = regionQuery(points, num_points, index, neighbors);
+
+    if (neighbor_count < minPts) {
+        points[index].cluster_id = NOISE;
+        return 0;
     }
 
-    json j;
-    in >> j;
-    std::vector<Feature> features;
+    points[index].cluster_id = cluster_id;
 
-    for (const auto& feature_json : j["features"]) {
-        Feature f;
-        const auto& geometry = feature_json["geometry"];
-        const std::string& type = geometry["type"];
+    for (int i = 0; i < neighbor_count; ++i) {
+        int neighbor_index = neighbors[i];
 
-        if (type == "Point") {
-            f.type = GeometryType::Point;
-            auto coord = geometry["coordinates"];
-            f.geometry.push_back({ { coord[0], coord[1] } });
+        if (points[neighbor_index].cluster_id == UNCLASSIFIED || points[neighbor_index].cluster_id == NOISE) {
+            points[neighbor_index].cluster_id = cluster_id;
 
-        } else if (type == "LineString") {
-            f.type = GeometryType::LineString;
-            std::vector<Point> line;
-            for (const auto& coord : geometry["coordinates"]) {
-                line.push_back({ coord[0], coord[1] });
-            }
-            f.geometry.push_back(line);
+            int neighbor_neighbors[MAX_POINTS];
+            int nn_count = regionQuery(points, num_points, neighbor_index, neighbor_neighbors);
 
-        } else if (type == "Polygon") {
-            f.type = GeometryType::Polygon;
-            for (const auto& ring : geometry["coordinates"]) {
-                std::vector<Point> ring_points;
-                for (const auto& coord : ring) {
-                    ring_points.push_back({ coord[0], coord[1] });
-                }
-                f.geometry.push_back(ring_points);
-            }
-
-        } else if (type == "MultiLineString") {
-            f.type = GeometryType::MultiLineString;
-            for (const auto& line : geometry["coordinates"]) {
-                std::vector<Point> line_points;
-                for (const auto& coord : line) {
-                    line_points.push_back({ coord[0], coord[1] });
-                }
-                f.geometry.push_back(line_points);
-            }
-
-        } else if (type == "MultiPolygon") {
-            f.type = GeometryType::MultiPolygon;
-            for (const auto& polygon : geometry["coordinates"]) {
-                for (const auto& ring : polygon) {
-                    std::vector<Point> ring_points;
-                    for (const auto& coord : ring) {
-                        ring_points.push_back({ coord[0], coord[1] });
+            if (nn_count >= minPts) {
+                for (int j = 0; j < nn_count; ++j) {
+                    int n_idx = neighbor_neighbors[j];
+                    // 중복 방지
+                    int already_in = 0;
+                    for (int k = 0; k < neighbor_count; ++k) {
+                        if (neighbors[k] == n_idx) {
+                            already_in = 1;
+                            break;
+                        }
                     }
-                    f.geometry.push_back(ring_points);
+                    if (!already_in && neighbor_count < MAX_POINTS) {
+                        neighbors[neighbor_count++] = n_idx;
+                    }
                 }
             }
-
-        } else {
-            std::cerr << "Unsupported geometry type: " << type << std::endl;
-            continue;
-        }
-
-        // properties 저장 (C++11 호환)
-        auto props = feature_json["properties"];
-        for (auto it = props.items().begin(); it != props.items().end(); ++it) {
-            std::string key = it.key();
-            std::string val = it.value().dump(); // JSON 형태로 저장
-            f.properties[key] = val;
-        }
-
-        features.push_back(f);
-    }
-
-    // 바이너리 버퍼 생성
-    std::vector<char> buffer;
-    size_t feature_count = features.size();
-    write_to_buffer(buffer, &feature_count, sizeof(size_t));
-
-    for (const auto& f : features) {
-        uint8_t type = static_cast<uint8_t>(f.type);
-        write_to_buffer(buffer, &type, sizeof(uint8_t));
-
-        // geometry
-        size_t outer = f.geometry.size();
-        write_to_buffer(buffer, &outer, sizeof(size_t));
-        for (const auto& line : f.geometry) {
-            size_t count = line.size();
-            write_to_buffer(buffer, &count, sizeof(size_t));
-            write_to_buffer(buffer, line.data(), sizeof(Point) * count);
-        }
-
-        // properties
-        size_t prop_count = f.properties.size();
-        write_to_buffer(buffer, &prop_count, sizeof(size_t));
-        for (const auto& kv : f.properties) {
-            write_string(buffer, kv.first);
-            write_string(buffer, kv.second);
         }
     }
 
-    // 압축
-    uLongf compressed_size = compressBound(buffer.size());
-    std::vector<uint8_t> compressed_data(compressed_size);
+    return 1;
+}
 
-    if (compress(compressed_data.data(), &compressed_size,
-                 reinterpret_cast<const Bytef*>(buffer.data()), buffer.size()) != Z_OK) {
-        std::cerr << "Compression failed\n";
-        return;
+void dbscan(Point* points, int num_points) {
+    int cluster_id = 1;
+
+    for (int i = 0; i < num_points; ++i) {
+        if (points[i].cluster_id == UNCLASSIFIED) {
+            if (expandCluster(points, num_points, i, cluster_id)) {
+                cluster_id++;
+            }
+        }
+    }
+}
+
+int main() {
+    Point points[MAX_POINTS] = {
+        {0.0, 0.0, UNCLASSIFIED}, {0.2, 0.1, UNCLASSIFIED}, {0.3, -0.2, UNCLASSIFIED},
+        {10.0, 10.0, UNCLASSIFIED}, {10.1, 10.2, UNCLASSIFIED}, {9.9, 10.1, UNCLASSIFIED},
+        {50.0, 50.0, UNCLASSIFIED}
+    };
+
+    int num_points = 7;
+
+    eps = 1.0;
+    minPts = 2;
+
+    dbscan(points, num_points);
+
+    for (int i = 0; i < num_points; ++i) {
+        printf("Point (%.2f, %.2f) -> Cluster %d\n", points[i].x, points[i].y, points[i].cluster_id);
     }
 
-    // 압축된 데이터 저장
-    std::ofstream out(bin_file, std::ios::binary);
-    size_t uncompressed_size = buffer.size();
-    out.write(reinterpret_cast<const char*>(&uncompressed_size), sizeof(size_t));
-    out.write(reinterpret_cast<const char*>(&compressed_size), sizeof(size_t));
-    out.write(reinterpret_cast<const char*>(compressed_data.data()), compressed_size);
-    out.close();
-
-    std::cout << "Saved compressed binary: " << bin_file << " (" << compressed_size << " bytes)\n";
+    return 0;
 }
