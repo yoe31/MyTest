@@ -6,14 +6,12 @@ typedef struct {
     float y;
 } Point;
 
-// 두 점 사이 거리
 float distance(Point a, Point b) {
     float dx = b.x - a.x;
     float dy = b.y - a.y;
     return sqrtf(dx * dx + dy * dy);
 }
 
-// 벡터 정규화
 void normalize(float* dx, float* dy) {
     float len = sqrtf((*dx) * (*dx) + (*dy) * (*dy));
     if (len > 1e-6f) {
@@ -22,46 +20,51 @@ void normalize(float* dx, float* dy) {
     }
 }
 
-// 평행 이동 수행
-void shift_points_parallel(Point* points, int N, float start_ratio, float end_ratio, float shift_distance) {
-    if (N < 2 || start_ratio < 0.0f || end_ratio > 1.0f || start_ratio >= end_ratio) return;
+// 개선된: 선분 기준 비율로 이동
+int extract_shifted_points_from_segments(const Point* points, int N,
+                                         float start_ratio, float end_ratio, float shift_distance,
+                                         Point* shifted_out, int max_output_count) {
+    if (N < 2 || start_ratio < 0.0f || end_ratio > 1.0f || start_ratio >= end_ratio)
+        return 0;
 
-    float segment_lengths[N];
+    // 1. 전체 길이 계산
     float total_length = 0.0f;
-
-    segment_lengths[0] = 0.0f;
-    for (int i = 1; i < N; ++i) {
-        segment_lengths[i] = distance(points[i - 1], points[i]);
+    float segment_lengths[N - 1];
+    for (int i = 0; i < N - 1; ++i) {
+        segment_lengths[i] = distance(points[i], points[i + 1]);
         total_length += segment_lengths[i];
     }
 
+    // 2. 선분 기준으로 비율 판단 및 평행이동
     float accumulated_length = 0.0f;
-    for (int i = 0; i < N; ++i) {
-        if (i > 0)
-            accumulated_length += segment_lengths[i];
+    int out_count = 0;
 
-        float ratio = accumulated_length / total_length;
-        if (ratio >= start_ratio && ratio < end_ratio) {
-            // 인접한 선분의 방향 벡터 (앞 또는 뒤)
-            float dx, dy;
+    for (int i = 0; i < N - 1; ++i) {
+        float seg_len = segment_lengths[i];
+        float start_ratio_seg = accumulated_length / total_length;
+        float end_ratio_seg = (accumulated_length + seg_len) / total_length;
 
-            if (i < N - 1) {
-                dx = points[i + 1].x - points[i].x;
-                dy = points[i + 1].y - points[i].y;
-            } else {
-                dx = points[i].x - points[i - 1].x;
-                dy = points[i].y - points[i - 1].y;
-            }
+        // 만약 선분이 원하는 비율 범위와 겹친다면, 이 선분을 기준으로 shift
+        if (end_ratio_seg > start_ratio && start_ratio_seg < end_ratio) {
+            if (out_count >= max_output_count) break;
 
-            normalize(&dx, &dy);  // 방향 벡터 단위화
+            // 시작점 기준으로 이동
+            float dx = points[i + 1].x - points[i].x;
+            float dy = points[i + 1].y - points[i].y;
+            normalize(&dx, &dy);
 
-            // 수직 방향 벡터 (좌측 방향: 시계 반대 방향 90도 회전)
             float perp_x = -dy;
             float perp_y = dx;
 
-            // 평행이동
-            points[i].x += shift_distance * perp_x;
-            points[i].y += shift_distance * perp_y;
+            Point shifted;
+            shifted.x = points[i].x + shift_distance * perp_x;
+            shifted.y = points[i].y + shift_distance * perp_y;
+
+            shifted_out[out_count++] = shifted;
         }
+
+        accumulated_length += seg_len;
     }
+
+    return out_count;
 }
