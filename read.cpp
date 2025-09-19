@@ -1,86 +1,46 @@
-#include <stdio.h>
-#include <math.h>
+// main.cpp
+#include <opencv2/opencv.hpp>
+#include <cstdint>
+#include <iostream>
 
-typedef struct {
-    double x;
-    double y;
-} Point;
+int main()
+{
+    // --- 가정: 가로(width)=1280, 세로(height)=576 (추측입니다) ---
+    const int width  = 1280;
+    const int height = 576;
 
-enum ShiftResult {
-    SHIFT_OK = 0,
-    SHIFT_DEGENERATE_A = 1,
-    SHIFT_NOT_PARALLEL = 2
-};
-
-// 두 직선(A: pA1-pA2, B: pB1-pB2)을 검사하여
-// A를 B와 일치하도록 평행이동한 새로운 A의 점을 npA1,npA2에 저장.
-// 반환값: 0(성공), 1(A가 점으로 퇴화), 2(평행 아님)
-int shift_lineA_to_lineB(Point pA1, Point pA2, Point pB1, Point pB2,
-                         Point *npA1, Point *npA2, double eps) {
-    // A의 방향 벡터
-    double dxA = pA2.x - pA1.x;
-    double dyA = pA2.y - pA1.y;
-    // B의 방향 벡터
-    double dxB = pB2.x - pB1.x;
-    double dyB = pB2.y - pB1.y;
-
-    // A가 점으로 퇴화했는지 검사
-    if (fabs(dxA) < eps && fabs(dyA) < eps) {
-        return SHIFT_DEGENERATE_A;
+    // 실제로는 아래 imagearry를 사용자가 채운 데이터로 교체하세요.
+    // 아래는 테스트용으로 그라데이션을 채워 보여주는 예시입니다.
+    static uint8_t imagearry[width * height];
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            imagearry[y * width + x] = static_cast<uint8_t>((x * 255) / (width - 1));
+        }
     }
 
-    // 평행성 검사: 방향 벡터 외적 == 0 이면 평행
-    double cross = dxA * dyB - dyA * dxB;
-    if (fabs(cross) > eps) {
-        return SHIFT_NOT_PARALLEL;
-    }
+    // imagearry 포인터를 이용해 OpenCV Mat 생성
+    // (만약 buffer의 row stride(피치)가 width와 다르면 마지막 인자에 stride를 넣으세요)
+    cv::Mat img_gray(height, width, CV_8UC1, imagearry);
 
-    // A 직선의 계수 (a*x + b*y + c = 0)
-    double a = pA1.y - pA2.y;
-    double b = pA2.x - pA1.x;
-    double c = pA1.x * pA2.y - pA2.x * pA1.y;
+    // 원본 버퍼가 이후 변경될 가능성이 있으면 clone()으로 안전하게 복사하세요
+    cv::Mat display = img_gray.clone();
 
-    double norm = sqrt(a*a + b*b);
-    if (norm < eps) { // 보호 (사실 위에서 검사했지만 안전하게)
-        return SHIFT_DEGENERATE_A;
-    }
+    // 회색조 창
+    cv::namedWindow("Grayscale", cv::WINDOW_AUTOSIZE);
+    cv::imshow("Grayscale", display);
 
-    // B의 한 점을 A 식에 넣어 signed distance 계산
-    double signed_dist = (a * pB1.x + b * pB1.y + c) / norm;
+    // (선택) 컬러맵 적용해서 보기 (가독성 좋음)
+    cv::Mat color;
+    cv::applyColorMap(display, color, cv::COLORMAP_JET);
+    cv::namedWindow("Color (JET)", cv::WINDOW_AUTOSIZE);
+    cv::imshow("Color (JET)", color);
 
-    // 이동벡터 t = signed_dist * (a,b)/norm
-    double tx = signed_dist * (a / norm);
-    double ty = signed_dist * (b / norm);
+    std::cout << "이미지 창에서 아무 키를 누르면 종료됩니다.\n";
+    cv::waitKey(0);
 
-    // A의 두 점 이동
-    npA1->x = pA1.x + tx;
-    npA1->y = pA1.y + ty;
-    npA2->x = pA2.x + tx;
-    npA2->y = pA2.y + ty;
-
-    return SHIFT_OK;
-}
-
-int main(void) {
-    // 예시: A: (0,0)-(4,0)  (y=0)
-    //       B: (0,2)-(1,2)  (y=2)
-    Point A1 = {0.0, 0.0};
-    Point A2 = {4.0, 0.0};
-    Point B1 = {0.0, 2.0};
-    Point B2 = {1.0, 2.0};
-
-    Point nA1, nA2;
-    int r = shift_lineA_to_lineB(A1, A2, B1, B2, &nA1, &nA2, 1e-12);
-
-    if (r == SHIFT_OK) {
-        printf("평행이동 성공.\n");
-        printf("이동된 A의 점: (%.10f, %.10f) ~ (%.10f, %.10f)\n",
-               nA1.x, nA1.y, nA2.x, nA2.y);
-    } else if (r == SHIFT_DEGENERATE_A) {
-        printf("오류: 직선 A가 두 동일한 점으로 퇴화했습니다.\n");
-    } else if (r == SHIFT_NOT_PARALLEL) {
-        printf("오류: 직선 A와 B는 평행이 아닙니다. (평행여부를 확인하세요)\n");
-    }
+    // (선택) 파일로 저장
+    cv::imwrite("out_gray.png", display);
+    cv::imwrite("out_color.png", color);
 
     return 0;
 }
