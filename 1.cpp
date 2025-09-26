@@ -9,3 +9,18 @@ static double M_of_R_A(double Rv, double Av, const DPP *pp) {
     }
     return 0.5 * M;
 }
+
+
+// before: auto Mfunc = [&](double Rv, double Av)->double { ... };
+// after: (use M_of_R_A)
+
+    double epsR = 1e-5;
+    double epsA = 1e-6;
+    double R = Rhat, A = alpha_opt;
+
+    double M_rr = (M_of_R_A(R+epsR, A, &pp) - 2.0*M_of_R_A(R, A, &pp) + M_of_R_A(R-epsR, A, &pp)) / (epsR*epsR);
+    double M_aa = (M_of_R_A(R, A+epsA, &pp) - 2.0*M_of_R_A(R, A, &pp) + M_of_R_A(R, A-epsA, &pp)) / (epsA*epsA);
+    double M_ra = (M_of_R_A(R+epsR, A+epsA, &pp) - M_of_R_A(R+epsR, A-epsA, &pp)
+                   - M_of_R_A(R-epsR, A+epsA, &pp) + M_of_R_A(R-epsR, A-epsA, &pp))
+                   / (4.0 * epsR * epsA);
+
