@@ -1,474 +1,717 @@
-// filename: lane_merge.c
-// Compile: gcc lane_merge.c -lm -o lane_merge
-// Run: ./lane_merge
-// 설명: 예시 프레임 데이터를 사용하여
-// 1) 각 인식 차선을 weighted PCA로 직선 적합 (normal form r,theta)
-// 2) 간단한 공분산 근사 계산 (논문 수식의 근사/휴리스틱)
-// 3) 프레임간 DR(DeltaX,DeltaY,DeltaH)을 누적하여 글로벌 pose 계산
-// 4) 각 프레임의 라인을 글로벌로 변환(선 파라미터 변환 & 공분산 전파)
-// 5) Mahalanobis(chi2) 기준으로 기존 맵의 라인과 병합(정보 행렬 합산 방식)
-// 6) 프레임별 병합 후 맵을 출력
+// merge_line_circle_local.c
+// Compile: gcc -std=c11 -O2 merge_line_circle_local.c -lm -o merge_test
+// Optionally build with example: gcc -std=c11 -O2 -DMERGE_EXAMPLE merge_line_circle_local.c -lm -o merge_test
 //
-// 주의: 일부 노이즈/가중치/공분산 전파는 실용적 근사(=추측입니다)로 구현했습니다.
+// Merge() keeps map in ego-local coords; supports LINE and CIRCLE models with AIC selection.
+// No file I/O. No lambdas. All in C.
 
 #include <stdio.h>
-#include <math.h>
-#include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
-#define MAX_POINTS 20
-#define MAX_LANES   30
-#define MAX_FRAMES  10
-#define MAX_MAP_LINES 200
-#define PI 3.14159265358979323846
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
-// --- 데이터 구조 ---
+// ----------------- User-tunable params -----------------
+static double sigma_d = 0.02;     // range noise std (m) — adjust for your sensor (example 2cm)
+static double sigma_phi = 0.001;  // angular noise std (rad) — adjust (~0.057deg)
+static double LINE_CHI2_THRESH = 5.991;  // DOF=2, 95%
+static double CIRCLE_CHI2_THRESH = 7.815; // DOF=3, 95%
+
+// ----------------- Types -----------------
+typedef struct { double dX, dY, dH; } DR; // dH in radians, CCW+
+
+#define MAX_POINTS 128
+#define MAX_LANES  32
+#define MAX_MAP    512
+
 typedef struct {
-    double dx; // forward +X (m)
-    double dy; // left +Y (m)
-    double dh; // heading change (rad) (반시계+)
-} DR;
-
-typedef struct {
-    uint8_t NumOfPoints;
-    float Points[MAX_POINTS][2]; // 0:X, 1:Y  (local vehicle frame)
+    int NumOfPoints;
+    double pts[MAX_POINTS][2]; // local coords: [i][0]=x, [i][1]=y
 } LaneLineInfo;
 
-typedef struct {
-    uint8_t NumOfLane;
-    LaneLineInfo lane_line_info_list[MAX_LANES];
-} FrameObs;
-
-// Line parameter in normal form: r = x*cos(theta) + y*sin(theta)
-// store covariance of [r, theta] (2x2)
-typedef struct {
-    double r;
-    double theta; // normalized to [-pi,pi)
-    double cov[2][2];
-    int id;       // map id
-    int count;    // how many segments merged
-} LineParam;
+typedef enum { PRIM_LINE = 0, PRIM_CIRCLE = 1 } PrimitiveType;
 
 typedef struct {
-    double x;
-    double y;
-    double theta;
-} Pose;
+    int id;
+    PrimitiveType type;
+    // For LINE: R, alpha (normal form). For CIRCLE: a,b,r (center + radius).
+    double params[3];
+    double cov[3][3]; // for LINE only [0..1][0..1] used; for CIRCLE full 3x3
+    double x1,y1,x2,y2; // endpoints for visualization (local coords). For circle store arc endpoints (or approximations)
+    int count; // number of merges
+} MapLine;
 
-// --- 유틸 ---
-static double normalize_angle(double a) {
-    while (a <= -PI) a += 2*PI;
-    while (a > PI) a -= 2*PI;
+// ----------------- Utilities -----------------
+static double norm_ang(double a){
+    while (a <= -M_PI) a += 2*M_PI;
+    while (a > M_PI) a -= 2*M_PI;
     return a;
 }
 
-static void ensure_positive_r_theta(double *r, double *theta) {
-    // make r >= 0 by flipping sign if needed (and rotate theta by pi)
-    if (*r < 0) {
-        *r = -(*r);
-        *theta = normalize_angle((*theta) + PI);
-    } else {
-        *theta = normalize_angle(*theta);
-    }
-}
-
-// invert 2x2 matrix A into invA; returns 0 if failed (near-singular)
-static int invert_2x2(double A[2][2], double invA[2][2]) {
+static int invert2x2(const double A[2][2], double out[2][2]) {
     double det = A[0][0]*A[1][1] - A[0][1]*A[1][0];
-    double eps = 1e-9;
-    if (fabs(det) < eps) return 0;
-    invA[0][0] =  A[1][1] / det;
-    invA[1][1] =  A[0][0] / det;
-    invA[0][1] = -A[0][1] / det;
-    invA[1][0] = -A[1][0] / det;
+    if (fabs(det) < 1e-14) return 0;
+    out[0][0] =  A[1][1]/det;
+    out[1][1] =  A[0][0]/det;
+    out[0][1] = -A[0][1]/det;
+    out[1][0] = -A[1][0]/det;
+    return 1;
+}
+static int invert3x3(const double A[3][3], double out[3][3]) {
+    // analytic inverse for 3x3
+    double a11=A[0][0], a12=A[0][1], a13=A[0][2];
+    double a21=A[1][0], a22=A[1][1], a23=A[1][2];
+    double a31=A[2][0], a32=A[2][1], a33=A[2][2];
+    double det = a11*(a22*a33 - a23*a32) - a12*(a21*a33 - a23*a31) + a13*(a21*a32 - a22*a31);
+    if (fabs(det) < 1e-16) return 0;
+    out[0][0] =  (a22*a33 - a23*a32)/det;
+    out[0][1] = -(a12*a33 - a13*a32)/det;
+    out[0][2] =  (a12*a23 - a13*a22)/det;
+    out[1][0] = -(a21*a33 - a23*a31)/det;
+    out[1][1] =  (a11*a33 - a13*a31)/det;
+    out[1][2] = -(a11*a23 - a13*a21)/det;
+    out[2][0] =  (a21*a32 - a22*a31)/det;
+    out[2][1] = -(a11*a32 - a12*a31)/det;
+    out[2][2] =  (a11*a22 - a12*a21)/det;
     return 1;
 }
 
-// add small diagonal regularization
-static void regularize_2x2(double A[2][2], double eps) {
-    A[0][0] += eps;
-    A[1][1] += eps;
+static void mat3_mul_vec(const double M[3][3], const double v[3], double out[3]) {
+    for (int i=0;i<3;i++) out[i] = M[i][0]*v[0] + M[i][1]*v[1] + M[i][2]*v[2];
+}
+static void mat3_mul_mat(const double A[3][3], const double B[3][3], double C[3][3]) {
+    for (int i=0;i<3;i++) for (int j=0;j<3;j++){
+        double s=0;
+        for (int k=0;k<3;k++) s += A[i][k]*B[k][j];
+        C[i][j]=s;
+    }
 }
 
-// multiply 2x2 * 2x1
-static void mat2_mul_vec2(double M[2][2], double v[2], double out[2]) {
-    out[0] = M[0][0]*v[0] + M[0][1]*v[1];
-    out[1] = M[1][0]*v[0] + M[1][1]*v[1];
+// ----------------- Sensor model Pk approx -----------------
+// Use practical approx: Pk = sigma_d^2 + (sigma_phi * d_k)^2  (diagonalized simplification)
+// This is a reasonable practical approximation (추측입니다).
+static double compute_Pk_simple(double d_k) {
+    double P = sigma_d*sigma_d + (sigma_phi * d_k) * (sigma_phi * d_k);
+    if (P < 1e-12) P = 1e-12;
+    return P;
 }
 
-// --- 가중 직선 적합 (PCA 기반) ---
-// 입력: lane (points in vehicle frame)
-// 출력: r,theta, cov(2x2) 근사
-// 참고: 가중치는 거리 기반의 간단한 센서 노이즈 가정 사용 (추측입니다).
-static int fit_weighted_line_pca(const LaneLineInfo *lane, double *out_r, double *out_theta, double cov_out[2][2]) {
-    int n = lane->NumOfPoints;
-    if (n < 2) return 0;
-
-    double sum_w = 0.0;
-    double cx = 0.0, cy = 0.0;
-
-    // heuristic sensor noise model: sigma_range = base + k * range  (추측입니다)
-    const double sigma_base = 0.05; // 5 cm base noise (추측)
-    const double sigma_k = 0.01;    // noise grows 1cm per meter (추측)
-
-    double weights[MAX_POINTS];
-    for (int i=0;i<n;i++) {
-        double x = lane->Points[i][0];
-        double y = lane->Points[i][1];
-        double range = sqrt(x*x + y*y);
-        double sigma = sigma_base + sigma_k * range;
-        double w = 1.0 / (sigma*sigma + 1e-12);
-        weights[i] = w;
-        sum_w += w;
-        cx += w * x;
-        cy += w * y;
+// ----------------- LINE: Pfister core functions -----------------
+// We implement negloglik_alpha and R computation as in Pfister.
+// input: arrays d[k], phi[k], n
+typedef struct { int n; const double *d; const double *phi; } DPP;
+static double negloglik_alpha_pfister(double alpha, const DPP *pp, double *outR) {
+    int n = pp->n;
+    double sum_invPk = 0.0;
+    double numR = 0.0;
+    for (int k=0;k<n;k++) {
+        double Pk = compute_Pk_simple(pp->d[k]); // using simple Pk (we drop angular dependence for speed here)
+        double invPk = 1.0 / Pk;
+        sum_invPk += invPk;
+        numR += pp->d[k] * cos(alpha - pp->phi[k]) * invPk;
     }
-    if (sum_w <= 0) return 0;
-    cx /= sum_w;
-    cy /= sum_w;
-
-    // weighted covariance matrix (Sxx,Syy,Sxy)
-    double Sxx=0.0, Syy=0.0, Sxy=0.0;
-    for (int i=0;i<n;i++) {
-        double x = lane->Points[i][0] - cx;
-        double y = lane->Points[i][1] - cy;
-        double w = weights[i];
-        Sxx += w * x * x;
-        Syy += w * y * y;
-        Sxy += w * x * y;
+    double PRR = 1.0 / (sum_invPk + 1e-16);
+    double Rhat = PRR * numR;
+    if (outR) *outR = Rhat;
+    double M = 0.0;
+    for (int k=0;k<n;k++) {
+        double Pk = compute_Pk_simple(pp->d[k]);
+        double delta = pp->d[k]*cos(alpha - pp->phi[k]) - Rhat;
+        M += (delta*delta)/Pk + log(Pk);
     }
-    // normalize by sum_w to get covariance
-    Sxx /= sum_w;
-    Syy /= sum_w;
-    Sxy /= sum_w;
-
-    // PCA eigen decomposition (2x2)
-    double trace = Sxx + Syy;
-    double diff = Sxx - Syy;
-    double sq = sqrt(diff*diff + 4*Sxy*Sxy);
-    double lambda1 = 0.5*(trace + sq); // larger (along-line variance)
-    double lambda2 = 0.5*(trace - sq); // smaller (perp variance)
-
-    // direction (principal axis) angle
-    double dir = 0.5 * atan2(2*Sxy, diff); // direction of largest variance
-    // normal vector angle (theta): perpendicular to direction
-    double theta = normalize_angle(dir + PI/2.0);
-
-    double r = cx * cos(theta) + cy * sin(theta);
-    ensure_positive_r_theta(&r, &theta);
-
-    // Covariance approximation (heuristic / simplified)
-    // - var_r ~ lambda2 / N_eff  (perp-variance averaged)
-    // - var_theta ~ lambda2 / (N_eff * (lambda1 + eps))  (더 긴 선 -> 방향 추정 더 정확)
-    // 이 식들은 논문의 closed-form을 대체하는 실용적 근사입니다. (추측입니다)
-    double Neff = sum_w; // effective sample size (weights)
-    double eps = 1e-6;
-    double var_r = fabs(lambda2) / (Neff + eps);
-    double var_theta = fabs(lambda2) / ((Neff * (fabs(lambda1) + eps)) + eps);
-
-    // protect from tiny numbers
-    if (var_r < 1e-8) var_r = 1e-8;
-    if (var_theta < 1e-8) var_theta = 1e-8;
-
-    cov_out[0][0] = var_r; cov_out[0][1] = 0.0;
-    cov_out[1][0] = 0.0;  cov_out[1][1] = var_theta;
-
-    *out_r = r;
-    *out_theta = theta;
-    return 1;
+    return 0.5 * M;
 }
 
-// --- 라인 파라미터를 로컬->글로벌로 변환 (pose : global pose of vehicle at time of detection) ---
-// p_local: (r_local, theta_local) in vehicle frame
-// p_global: r_global = r_local + x*cos(theta_global) + y*sin(theta_global)
-//            theta_global = theta_local + pose.theta
-// Covariance 전파: J * Cov_local * J^T  (여기서는 pose covariance는 무시함, 즉 pose는 정확하다고 가정합니다. 추측입니다.)
-static void transform_line_to_global(const LineParam *local, const Pose *pose, LineParam *global_out) {
-    double theta_global = normalize_angle(local->theta + pose->theta);
-    double r_global = local->r + pose->x * cos(theta_global) + pose->y * sin(theta_global);
-
-    // Jacobian J = [ dr/dr_local , dr/dtheta_local ]
-    //              [ dtheta/dr_local , dtheta/dtheta_local ]
-    // dr/dr_local = 1
-    // dr/dtheta_local = d/dtheta_local [ x*cos(theta_local+pose.theta) + y*sin(...) ] = -x*sin(theta_global) + y*cos(theta_global)
-    double ddr_dtheta = -pose->x * sin(theta_global) + pose->y * cos(theta_global);
-
-    // dtheta/dr_local = 0
-    // dtheta/dtheta_local = 1
-    // J = [1, ddr_dtheta; 0, 1]
-    double J[2][2] = {{1.0, ddr_dtheta},{0.0, 1.0}};
-
-    // Cov_global = J * Cov_local * J^T
-    double temp[2][2] = { {0,0},{0,0} };
-    // temp = J * Cov_local
-    for (int i=0;i<2;i++) for (int j=0;j<2;j++) {
-        temp[i][j] = 0.0;
-        for (int k=0;k<2;k++) temp[i][j] += J[i][k] * local->cov[k][j];
-    }
-    double covg[2][2] = {{0,0},{0,0}};
-    for (int i=0;i<2;i++) for (int j=0;j<2;j++) {
-        covg[i][j] = 0.0;
-        for (int k=0;k<2;k++) covg[i][j] += temp[i][k] * J[j][k];
-    }
-    // numeric regularization
-    regularize_2x2(covg, 1e-9);
-
-    global_out->r = r_global;
-    global_out->theta = theta_global;
-    global_out->cov[0][0] = covg[0][0];
-    global_out->cov[0][1] = covg[0][1];
-    global_out->cov[1][0] = covg[1][0];
-    global_out->cov[1][1] = covg[1][1];
-    global_out->id = local->id;
-    global_out->count = local->count;
-}
-
-// --- chi2 distance between two lines (p = [r,theta]) ---
-// chi2 = (p1 - p2)^T * inv(S1+S2) * (p1 - p2)
-static double line_chi2(const LineParam *a, const LineParam *b) {
-    double da[2];
-    da[0] = a->r - b->r;
-    double dtheta = normalize_angle(a->theta - b->theta);
-    da[1] = dtheta;
-
-    double S[2][2];
-    S[0][0] = a->cov[0][0] + b->cov[0][0];
-    S[0][1] = a->cov[0][1] + b->cov[0][1];
-    S[1][0] = a->cov[1][0] + b->cov[1][0];
-    S[1][1] = a->cov[1][1] + b->cov[1][1];
-
-    // regularize small values
-    regularize_2x2(S, 1e-9);
-
-    double invS[2][2];
-    if (!invert_2x2(S, invS)) {
-        // near singular => return large distance
-        return 1e9;
-    }
-
-    double tmp[2];
-    mat2_mul_vec2(invS, da, tmp);
-    double chi2 = da[0]*tmp[0] + da[1]*tmp[1];
-    return chi2;
-}
-
-// --- merge two lines using information form (Kalman-like fusion) ---
-// p_merged = (S1^-1 + S2^-1)^-1 (S1^-1 p1 + S2^-1 p2)
-static void merge_lines(const LineParam *a, const LineParam *b, LineParam *out) {
-    double S1[2][2] = {{a->cov[0][0], a->cov[0][1]}, {a->cov[1][0], a->cov[1][1]}};
-    double S2[2][2] = {{b->cov[0][0], b->cov[0][1]}, {b->cov[1][0], b->cov[1][1]}};
-    regularize_2x2(S1, 1e-9);
-    regularize_2x2(S2, 1e-9);
-
-    double invS1[2][2], invS2[2][2];
-    int ok1 = invert_2x2(S1, invS1);
-    int ok2 = invert_2x2(S2, invS2);
-    if (!ok1 || !ok2) {
-        // fallback: simple average
-        out->r = 0.5*(a->r + b->r);
-        out->theta = normalize_angle(0.5*(a->theta + b->theta));
-        out->cov[0][0] = 0.5*(a->cov[0][0] + b->cov[0][0]);
-        out->cov[0][1] = 0.0;
-        out->cov[1][0] = 0.0;
-        out->cov[1][1] = 0.5*(a->cov[1][1] + b->cov[1][1]);
-        out->count = a->count + b->count;
-        return;
-    }
-
-    // Info = invS1 + invS2
-    double Info[2][2];
-    for (int i=0;i<2;i++) for (int j=0;j<2;j++) Info[i][j] = invS1[i][j] + invS2[i][j];
-
-    double invInfo[2][2];
-    if (!invert_2x2(Info, invInfo)) {
-        // numeric fallback
-        out->r = 0.5*(a->r + b->r);
-        out->theta = normalize_angle(0.5*(a->theta + b->theta));
-        out->cov[0][0] = 0.5*(a->cov[0][0] + b->cov[0][0]);
-        out->cov[1][1] = 0.5*(a->cov[1][1] + b->cov[1][1]);
-        out->cov[0][1]=out->cov[1][0]=0.0;
-        out->count = a->count + b->count;
-        return;
-    }
-
-    // rhs = invS1 * p1 + invS2 * p2
-    double p1[2] = {a->r, a->theta};
-    double p2[2] = {b->r, b->theta};
-    double rhs[2] = {0,0};
-    double tmp[2];
-    mat2_mul_vec2(invS1, p1, tmp);
-    rhs[0] += tmp[0]; rhs[1] += tmp[1];
-    mat2_mul_vec2(invS2, p2, tmp);
-    rhs[0] += tmp[0]; rhs[1] += tmp[1];
-
-    double pmerged[2];
-    mat2_mul_vec2(invInfo, rhs, pmerged);
-
-    out->r = pmerged[0];
-    out->theta = normalize_angle(pmerged[1]);
-    // cov merged = inv( invS1 + invS2 ) = invInfo
-    out->cov[0][0] = invInfo[0][0];
-    out->cov[0][1] = invInfo[0][1];
-    out->cov[1][0] = invInfo[1][0];
-    out->cov[1][1] = invInfo[1][1];
-
-    out->count = a->count + b->count;
-    // keep id of 'a' (map entry) by convention
-    out->id = a->id;
-}
-
-// --- MAP 저장소 ---
-static LineParam map_lines[MAX_MAP_LINES];
-static int map_line_count = 0;
-static int next_map_id = 1;
-
-// 매 프레임 변형된 라인(global) 을 맵에 병합
-// threshold : chi2 threshold (chi-square DOF=2)
-// 95% -> 5.991, 99% -> 9.210
-static void merge_into_map(const LineParam *global_line, double chi2_thresh) {
-    // find best match
-    double best_chi2 = 1e9;
-    int best_idx = -1;
-    for (int i=0;i<map_line_count;i++) {
-        double c = line_chi2(global_line, &map_lines[i]);
-        if (c < best_chi2) { best_chi2 = c; best_idx = i; }
-    }
-    if (best_idx >=0 && best_chi2 < chi2_thresh) {
-        // merge
-        LineParam merged;
-        merge_lines(&map_lines[best_idx], global_line, &merged);
-        merged.id = map_lines[best_idx].id; // keep id
-        map_lines[best_idx] = merged;
-    } else {
-        // add new map line
-        if (map_line_count < MAX_MAP_LINES) {
-            LineParam newl = *global_line;
-            newl.id = next_map_id++;
-            if (newl.count <= 0) newl.count = 1;
-            map_lines[map_line_count++] = newl;
+static double brent_minimize_double(double ax,double bx,double cx,
+    double (*f)(double,const DPP*,double*), const DPP *pp, double *out_x, double tol) {
+    const int ITMAX=80; const double CGOLD=0.3819660112501051; const double ZEPS=1e-12;
+    double a=fmin(ax,cx), b=fmax(ax,cx);
+    double x=bx,w=x,v=x;
+    double fx=f(x,pp,NULL), fw=fx, fv=fx;
+    double d=0,e=0;
+    for (int iter=0; iter<ITMAX; ++iter) {
+        double xm = 0.5*(a+b);
+        double tol1 = tol*fabs(x)+ZEPS;
+        double tol2 = 2.0*tol1;
+        if (fabs(x-xm) <= (tol2 - 0.5*(b-a))) break;
+        double p=0,q=0,r=0;
+        if (fabs(e) > tol1) {
+            r = (x-w)*(fx-fv);
+            q = (x-v)*(fx-fw);
+            p = (x-v)*q - (x-w)*r;
+            q = 2.0*(q-r);
+            if (q>0) p = -p;
+            q = fabs(q);
+            double etemp=e; e=d;
+            if (fabs(p) >= fabs(0.5*q*etemp) || p <= q*(a-x) || p >= q*(b-x)) {
+                e = (x >= xm)? a-x : b-x;
+                d = CGOLD * e;
+            } else {
+                d = p/q;
+                double u = x + d;
+                if (u - a < tol2 || b - u < tol2) d = (xm - x >= 0) ? fabs(tol1) : -fabs(tol1);
+            }
         } else {
-            // map full - ignore
+            e = (x >= xm)? a-x : b-x;
+            d = CGOLD * e;
+        }
+        double u = (fabs(d) >= tol1) ? x + d : x + ((d>0)?tol1:-tol1);
+        double fu = f(u, pp, NULL);
+        if (fu <= fx) {
+            if (u >= x) a = x; else b = x;
+            v = w; fv = fw;
+            w = x; fw = fx;
+            x = u; fx = fu;
+        } else {
+            if (u < x) a = u; else b = u;
+            if (fu <= fw || w==x) { v=w; fv=fw; w=u; fw=fu; }
+            else if (fu <= fv || v==x || v==w) { v=u; fv=fu; }
+        }
+    }
+    if (out_x) *out_x = x;
+    return fx;
+}
+
+// numeric Hessian for line: M(R,A). We'll compute M_of_R_A function.
+static double M_of_R_A(const double Rv, const double Av, const DPP *pp) {
+    int n = pp->n;
+    double M = 0.0;
+    for (int k=0;k<n;k++) {
+        double Pk = compute_Pk_simple(pp->d[k]);
+        double delta = pp->d[k]*cos(Av - pp->phi[k]) - Rv;
+        M += (delta*delta)/Pk + log(Pk);
+    }
+    return 0.5 * M;
+}
+
+// fit line per Pfister (uses simplified Pk for speed but follows ML structure)
+static int fit_line_pfister_local(const LaneLineInfo *L, double *outR, double *outAlpha, double cov2x2[2][2], double *e1x,double *e1y,double *e2x,double *e2y, double *negloglik_out) {
+    int n = L->NumOfPoints;
+    if (n < 2) return 0;
+    double d[MAX_POINTS], phi[MAX_POINTS];
+    for (int i=0;i<n;i++) { double x=L->pts[i][0], y=L->pts[i][1]; d[i]=hypot(x,y); phi[i]=atan2(y,x); }
+    DPP pp; pp.n=n; pp.d=d; pp.phi=phi;
+    // initial alpha: PCA
+    double cx=0,cy=0;
+    for (int i=0;i<n;i++){ cx += L->pts[i][0]; cy += L->pts[i][1]; }
+    cx /= n; cy /= n;
+    double Sxx=0,Syy=0,Sxy=0;
+    for (int i=0;i<n;i++){ double dx=L->pts[i][0]-cx, dy=L->pts[i][1]-cy; Sxx+=dx*dx; Syy+=dy*dy; Sxy+=dx*dy; }
+    double theta_dir = 0.5 * atan2(2*Sxy, Sxx - Syy);
+    double alpha0 = norm_ang(theta_dir + M_PI/2.0);
+    double a = alpha0-1.0, b=alpha0, c=alpha0+1.0;
+    double alpha_opt;
+    brent_minimize_double(a,b,c, negloglik_alpha_pfister, &pp, &alpha_opt, 1e-8);
+    double Rhat;
+    negloglik_alpha_pfister(alpha_opt, &pp, &Rhat);
+    // numeric Hessian of M(R,A)
+    double epsR = 1e-5, epsA = 1e-6;
+    double R=Rhat, A=alpha_opt;
+    double M_rr = (M_of_R_A(R+epsR,A,&pp) - 2.0*M_of_R_A(R,A,&pp) + M_of_R_A(R-epsR,A,&pp)) / (epsR*epsR);
+    double M_aa = (M_of_R_A(R,A+epsA,&pp) - 2.0*M_of_R_A(R,A,&pp) + M_of_R_A(R,A-epsA,&pp)) / (epsA*epsA);
+    double M_ra = (M_of_R_A(R+epsR,A+epsA,&pp) - M_of_R_A(R+epsR,A-epsA,&pp) - M_of_R_A(R-epsR,A+epsA,&pp) + M_of_R_A(R-epsR,A-epsA,&pp)) / (4.0*epsR*epsA);
+    double H[2][2] = {{M_rr, M_ra},{M_ra, M_aa}};
+    double cov[2][2];
+    if (!invert2x2(H, cov)) { cov[0][0]=1e-4; cov[0][1]=0; cov[1][0]=0; cov[1][1]=1e-4; }
+    // compute endpoints by projecting points onto line
+    double dirx = -sin(A), diry = cos(A);
+    double x0 = R * cos(A), y0 = R * sin(A);
+    double mn=1e12, mx=-1e12;
+    for (int k=0;k<n;k++){
+        double proj = L->pts[k][0]*dirx + L->pts[k][1]*diry;
+        if (proj < mn) mn = proj;
+        if (proj > mx) mx = proj;
+    }
+    *e1x = x0 + dirx * mn; *e1y = y0 + diry * mn;
+    *e2x = x0 + dirx * mx; *e2y = y0 + diry * mx;
+    *outR = Rhat; *outAlpha = norm_ang(A);
+    cov2x2[0][0] = cov[0][0]; cov2x2[0][1] = cov[0][1];
+    cov2x2[1][0] = cov[1][0]; cov2x2[1][1] = cov[1][1];
+    if (negloglik_out) *negloglik_out = M_of_R_A(R,A,&pp);
+    return 1;
+}
+
+// ----------------- CIRCLE fit (weighted Gauss-Newton) -----------------
+// Kasa initial guess then GN with damping, covariance via inv(J^T W J).
+// residual r_i = sqrt((xi-a)^2+(yi-b)^2) - r
+// Jacobian row: [ - (xi-a)/ri , - (yi-b)/ri , -1 ]
+static int circle_kasa_init(const LaneLineInfo *L, double *a0, double *b0, double *r0) {
+    int n = L->NumOfPoints; if (n<3) return 0;
+    // Kasa method (algebraic) for circle init: solve A*c = b where c=[D,E,F], circle: x^2+y^2 + D x + E y + F = 0
+    double Sxx=0,Sxy=0,Syy=0,Sx=0,Sy=0,Sxz=0,Syz=0, Sz=0;
+    for (int i=0;i<n;i++){
+        double x=L->pts[i][0], y=L->pts[i][1];
+        double z = x*x + y*y;
+        Sx += x; Sy += y; Sz += z;
+        Sxx += x*x; Syy += y*y; Sxy += x*y;
+        Sxz += x*z; Syz += y*z;
+    }
+    // Build normal eqn for [D E F]: [[Sxx Sxy Sx],[Sxy Syy Sy],[Sx Sy n]] * [D E F]^T = -[Sxz Syz Sz]^T
+    double M[3][3] = {
+        {Sxx, Sxy, Sx},
+        {Sxy, Syy, Sy},
+        {Sx,  Sy,  (double)n}
+    };
+    double rhs[3] = {-Sxz, -Syz, -Sz};
+    // simple solve 3x3 via Cramer's rule (or LU). Use analytic inverse for robustness.
+    double invM[3][3];
+    if (!invert3x3(M, invM)) return 0;
+    double c[3];
+    mat3_mul_vec(invM, rhs, c); // c = invM * rhs
+    double D = c[0], E = c[1], F = c[2];
+    double a = -D/2.0;
+    double b = -E/2.0;
+    double r = sqrt(a*a + b*b - F);
+    if (!isfinite(r) || r <= 0) return 0;
+    *a0 = a; *b0 = b; *r0 = r;
+    return 1;
+}
+
+static int fit_circle_weighted(const LaneLineInfo *L, double *out_a, double *out_b, double *out_r, double cov3x3[3][3], double *negloglik_out, double *e1x,double *e1y,double *e2x,double *e2y) {
+    int n = L->NumOfPoints;
+    if (n < 3) return 0;
+    double a,b,r;
+    if (!circle_kasa_init(L,&a,&b,&r)) {
+        // fallback centroid and mean radius
+        double cx=0,cy=0; for (int i=0;i<n;i++){ cx+=L->pts[i][0]; cy+=L->pts[i][1]; }
+        cx/=n; cy/=n;
+        double mr=0; for (int i=0;i<n;i++) mr += hypot(L->pts[i][0]-cx, L->pts[i][1]-cy);
+        mr /= n;
+        a = cx; b = cy; r = mr;
+    }
+    // Gauss-Newton with Levenberg damping
+    double lambda = 1e-3;
+    for (int iter=0; iter<50; ++iter) {
+        double JtWJ[3][3] = {{0}}; double JtWe[3] = {0,0,0};
+        double cost = 0.0;
+        for (int i=0;i<n;i++) {
+            double xi = L->pts[i][0], yi = L->pts[i][1];
+            double dx = xi - a, dy = yi - b;
+            double ri = hypot(dx,dy);
+            if (ri < 1e-12) ri = 1e-12;
+            double res = ri - r;
+            double Pk = compute_Pk_simple(hypot(xi,yi));
+            double w = 1.0 / Pk;
+            cost += 0.5 * w * res * res;
+            double J0 = -(dx/ri), J1 = -(dy/ri), J2 = -1.0;
+            // accumulate J^T W J and J^T W e
+            JtWJ[0][0] += w * J0 * J0; JtWJ[0][1] += w * J0 * J1; JtWJ[0][2] += w * J0 * J2;
+            JtWJ[1][0] += w * J1 * J0; JtWJ[1][1] += w * J1 * J1; JtWJ[1][2] += w * J1 * J2;
+            JtWJ[2][0] += w * J2 * J0; JtWJ[2][1] += w * J2 * J1; JtWJ[2][2] += w * J2 * J2;
+            JtWe[0] += w * J0 * res; JtWe[1] += w * J1 * res; JtWe[2] += w * J2 * res;
+        }
+        // Levenberg damping
+        for (int d=0; d<3; d++) JtWJ[d][d] *= (1.0 + lambda);
+        // solve linear system JtWJ * dx = JtWe  (we seek dx to add to params)
+        double invJtWJ[3][3];
+        if (!invert3x3(JtWJ, invJtWJ)) {
+            // singular -> increase damping and continue
+            lambda *= 10;
+            if (lambda > 1e6) break;
+            continue;
+        }
+        double dx[3]; mat3_mul_vec(invJtWJ, JtWe, dx);
+        // update params
+        double an = a + dx[0], bn = b + dx[1], rn = r + dx[2];
+        if (rn <= 0) { lambda *= 10; continue; }
+        // compute new cost to check improvement
+        double newcost = 0.0;
+        for (int i=0;i<n;i++){
+            double xi=L->pts[i][0], yi=L->pts[i][1];
+            double ri = hypot(xi - an, yi - bn); if (ri<1e-12) ri=1e-12;
+            double res = ri - rn;
+            double Pk = compute_Pk_simple(hypot(xi,yi));
+            double w = 1.0 / Pk;
+            newcost += 0.5 * w * res * res;
+        }
+        if (newcost < cost) {
+            // accept
+            a=an; b=bn; r=rn;
+            lambda *= 0.7; if (lambda < 1e-12) lambda = 1e-12;
+            // check small update
+            if (fabs(dx[0])<1e-6 && fabs(dx[1])<1e-6 && fabs(dx[2])<1e-6) break;
+        } else {
+            // reject, increase damping
+            lambda *= 10;
+            if (lambda > 1e8) break;
+        }
+    }
+    // compute final covariance as inv(J^T W J) without damping
+    double JtWJf[3][3] = {{0}};
+    for (int i=0;i<n;i++){
+        double xi=L->pts[i][0], yi=L->pts[i][1];
+        double dx = xi - a, dy = yi - b;
+        double ri = hypot(dx,dy); if (ri < 1e-12) ri = 1e-12;
+        double res = ri - r;
+        double Pk = compute_Pk_simple(hypot(xi,yi));
+        double w = 1.0 / Pk;
+        double J0 = -(dx/ri), J1 = -(dy/ri), J2 = -1.0;
+        JtWJf[0][0] += w*J0*J0; JtWJf[0][1] += w*J0*J1; JtWJf[0][2] += w*J0*J2;
+        JtWJf[1][0] += w*J1*J0; JtWJf[1][1] += w*J1*J1; JtWJf[1][2] += w*J1*J2;
+        JtWJf[2][0] += w*J2*J0; JtWJf[2][1] += w*J2*J1; JtWJf[2][2] += w*J2*J2;
+    }
+    double cov3[3][3];
+    if (!invert3x3(JtWJf, cov3)) {
+        // fallback diagonal small
+        for (int i=0;i<3;i++) for (int j=0;j<3;j++) cov3[i][j] = (i==j)?1e-4:0.0;
+    }
+    // endpoints: project points onto circle and take extremes along some angle span (approx)
+    // Compute angles of points relative to center and take min/max to get arc endpoints (local coords)
+    double amin = 1e12, amax = -1e12;
+    for (int i=0;i<n;i++){
+        double ang = atan2(L->pts[i][1] - b, L->pts[i][0] - a);
+        if (ang < amin) amin = ang;
+        if (ang > amax) amax = ang;
+    }
+    *e1x = a + r * cos(amin); *e1y = b + r * sin(amin);
+    *e2x = a + r * cos(amax); *e2y = b + r * sin(amax);
+    *out_a = a; *out_b = b; *out_r = r;
+    if (negloglik_out) {
+        double M=0;
+        for (int i=0;i<n;i++){
+            double xi=L->pts[i][0], yi=L->pts[i][1];
+            double ri = hypot(xi - a, yi - b); if (ri < 1e-12) ri=1e-12;
+            double res = ri - r;
+            double Pk = compute_Pk_simple(hypot(xi,yi));
+            M += (res*res)/Pk + log(Pk);
+        }
+        *negloglik_out = 0.5 * M;
+    }
+    // copy cov
+    for (int i=0;i<3;i++) for (int j=0;j<3;j++) cov3x3[i][j] = cov3[i][j];
+    return 1;
+}
+
+// ----------------- Map transform when vehicle moves by dr (map stored in old ego-local, we want new ego-local) -----------------
+// For LINE: derived earlier:
+// alpha_new = alpha_old - dH
+// R_new = R_old - (dX * cos(alpha_old) + dY * sin(alpha_old))
+// covariance J = [[1, dX*sin(alpha_old) - dY*cos(alpha_old)], [0,1]] applied on cov
+// endpoints: p_new = R(-dH) * (p_old - dr)
+// For CIRCLE: center transforms as point, radius unchanged.
+// Covariance for circle: J = [[cos(-dH), -sin(-dH), 0],[sin(-dH), cos(-dH),0],[0,0,1]] applied to cov(a,b,r)
+static void transform_map_by_dr(MapLine map[], int map_count, const DR *dr) {
+    if (!dr) return;
+    double dX = dr->dX, dY = dr->dY, dH = dr->dH;
+    double ca = cos(-dH), sa = sin(-dH); // for endpoints transform
+    for (int i=0;i<map_count;i++){
+        MapLine *m = &map[i];
+        if (m->type == PRIM_LINE) {
+            double alpha_old = m->params[1];
+            double alpha_new = norm_ang(alpha_old - dH);
+            double R_new = m->params[0] - (dX * cos(alpha_old) + dY * sin(alpha_old));
+            // jacobian J (2x2)
+            double J[2][2];
+            J[0][0] = 1.0;
+            J[0][1] = dX * sin(alpha_old) - dY * cos(alpha_old);
+            J[1][0] = 0.0;
+            J[1][1] = 1.0;
+            // cov_old is in m->cov [0..1][0..1]
+            double tmp[2][2] = {{0,0},{0,0}}, cov_new2[2][2] = {{0,0},{0,0}};
+            for (int r=0;r<2;r++) for (int c=0;c<2;c++) {
+                tmp[r][c] = J[r][0]*m->cov[0][c] + J[r][1]*m->cov[1][c];
+            }
+            for (int r=0;r<2;r++) for (int c=0;c<2;c++) {
+                cov_new2[r][c] = tmp[r][0]*J[c][0] + tmp[r][1]*J[c][1];
+            }
+            // endpoints rotation+translate
+            double px1 = m->x1 - dX, py1 = m->y1 - dY;
+            double px2 = m->x2 - dX, py2 = m->y2 - dY;
+            double nx1 = ca*px1 - sa*py1, ny1 = sa*px1 + ca*py1;
+            double nx2 = ca*px2 - sa*py2, ny2 = sa*px2 + ca*py2;
+            // commit
+            m->params[0] = R_new; m->params[1] = alpha_new;
+            m->cov[0][0] = cov_new2[0][0]; m->cov[0][1] = cov_new2[0][1];
+            m->cov[1][0] = cov_new2[1][0]; m->cov[1][1] = cov_new2[1][1];
+            m->x1 = nx1; m->y1 = ny1; m->x2 = nx2; m->y2 = ny2;
+        } else if (m->type == PRIM_CIRCLE) {
+            double a = m->params[0], b = m->params[1], r = m->params[2];
+            // center transform: p_new = R(-dH)*(p_old - dr)
+            double cx_old = a, cy_old = b;
+            double tx = cx_old - dX, ty = cy_old - dY;
+            double cx_new = ca*tx - sa*ty;
+            double cy_new = sa*tx + ca*ty;
+            // covariance transform: J = [[cos(-dH), -sin(-dH),0],[sin(-dH),cos(-dH),0],[0,0,1]]
+            double J[3][3] = {{ca,-sa,0},{sa,ca,0},{0,0,1}};
+            double tmp[3][3] = {{0}}, cov_new[3][3] = {{0}};
+            for (int r1=0;r1<3;r1++) for (int c1=0;c1<3;c1++){
+                tmp[r1][c1] = 0.0;
+                for (int k=0;k<3;k++) tmp[r1][c1] += J[r1][k] * m->cov[k][c1];
+            }
+            for (int r1=0;r1<3;r1++) for (int c1=0;c1<3;c1++){
+                cov_new[r1][c1] = 0.0;
+                for (int k=0;k<3;k++) cov_new[r1][c1] += tmp[r1][k] * J[c1][k];
+            }
+            // transform endpoints similarly
+            double px1 = m->x1 - dX, py1 = m->y1 - dY;
+            double px2 = m->x2 - dX, py2 = m->y2 - dY;
+            double nx1 = ca*px1 - sa*py1, ny1 = sa*px1 + ca*py1;
+            double nx2 = ca*px2 - sa*py2, ny2 = sa*px2 + ca*py2;
+            m->params[0] = cx_new; m->params[1] = cy_new; m->params[2] = r;
+            for (int r1=0;r1<3;r1++) for (int c1=0;c1<3;c1++) m->cov[r1][c1] = cov_new[r1][c1];
+            m->x1 = nx1; m->y1 = ny1; m->x2 = nx2; m->y2 = ny2;
         }
     }
 }
 
-// --- 예시/테스트 데이터 (3 프레임 예시) ---
-// 각 프레임: DR (delta motion from previous frame), 그리고 인식된 lane 라인들 (local frame)
-static DR sample_dr[MAX_FRAMES] = {
-    {0.0, 0.0, 0.0}, // 첫 프레임은 이동 없음
-    {1.0, 0.0, 0.0}, // 차량이 +X (앞)으로 1m 이동
-    {1.0, 0.0, 0.0},
-};
-
-static FrameObs sample_frames[MAX_FRAMES];
-
-static void prepare_sample_frames() {
-    memset(sample_frames,0,sizeof(sample_frames));
-    // Frame 0: two lanes (approx x=10 and x=20 ahead)
-    sample_frames[0].NumOfLane = 2;
-    // lane 0: x ~ 10, y = -3,0,3
-    sample_frames[0].lane_line_info_list[0].NumOfPoints = 3;
-    sample_frames[0].lane_line_info_list[0].Points[0][0] = 10.0; sample_frames[0].lane_line_info_list[0].Points[0][1] = -3.0;
-    sample_frames[0].lane_line_info_list[0].Points[1][0] = 10.0; sample_frames[0].lane_line_info_list[0].Points[1][1] = 0.0;
-    sample_frames[0].lane_line_info_list[0].Points[2][0] = 10.0; sample_frames[0].lane_line_info_list[0].Points[2][1] = 3.0;
-    // lane 1: x ~ 20
-    sample_frames[0].lane_line_info_list[1].NumOfPoints = 3;
-    sample_frames[0].lane_line_info_list[1].Points[0][0] = 20.0; sample_frames[0].lane_line_info_list[1].Points[0][1] = -3.0;
-    sample_frames[0].lane_line_info_list[1].Points[1][0] = 20.0; sample_frames[0].lane_line_info_list[1].Points[1][1] = 0.0;
-    sample_frames[0].lane_line_info_list[1].Points[2][0] = 20.0; sample_frames[0].lane_line_info_list[1].Points[2][1] = 3.0;
-
-    // Frame1: robot moved forward 1m, so same global lane appears at local x ~ 9 and ~19 (plus small noise)
-    sample_frames[1].NumOfLane = 2;
-    sample_frames[1].lane_line_info_list[0].NumOfPoints = 3;
-    sample_frames[1].lane_line_info_list[0].Points[0][0] = 9.05; sample_frames[1].lane_line_info_list[0].Points[0][1] = -3.1;
-    sample_frames[1].lane_line_info_list[0].Points[1][0] = 8.95; sample_frames[1].lane_line_info_list[0].Points[1][1] = 0.05;
-    sample_frames[1].lane_line_info_list[0].Points[2][0] = 9.02; sample_frames[1].lane_line_info_list[0].Points[2][1] = 3.0;
-    sample_frames[1].lane_line_info_list[1].NumOfPoints = 3;
-    sample_frames[1].lane_line_info_list[1].Points[0][0] = 19.1; sample_frames[1].lane_line_info_list[1].Points[0][1] = -2.9;
-    sample_frames[1].lane_line_info_list[1].Points[1][0] = 19.0; sample_frames[1].lane_line_info_list[1].Points[1][1] = 0.1;
-    sample_frames[1].lane_line_info_list[1].Points[2][0] = 19.02; sample_frames[1].lane_line_info_list[1].Points[2][1] = 2.95;
-
-    // Frame2: forward another 1m
-    sample_frames[2].NumOfLane = 2;
-    sample_frames[2].lane_line_info_list[0].NumOfPoints = 3;
-    sample_frames[2].lane_line_info_list[0].Points[0][0] = 8.1; sample_frames[2].lane_line_info_list[0].Points[0][1] = -3.05;
-    sample_frames[2].lane_line_info_list[0].Points[1][0] = 8.0; sample_frames[2].lane_line_info_list[0].Points[1][1] = 0.08;
-    sample_frames[2].lane_line_info_list[0].Points[2][0] = 8.05; sample_frames[2].lane_line_info_list[0].Points[2][1] = 3.02;
-    sample_frames[2].lane_line_info_list[1].NumOfPoints = 3;
-    sample_frames[2].lane_line_info_list[1].Points[0][0] = 18.2; sample_frames[2].lane_line_info_list[1].Points[0][1] = -3.0;
-    sample_frames[2].lane_line_info_list[1].Points[1][0] = 18.05; sample_frames[2].lane_line_info_list[1].Points[1][1] = 0.05;
-    sample_frames[2].lane_line_info_list[1].Points[2][0] = 18.1; sample_frames[2].lane_line_info_list[1].Points[2][1] = 3.1;
+// ----------------- chi2 and merge for LINE and CIRCLE -----------------
+static double chi2_line(const MapLine *A, const MapLine *B) {
+    // dv = [R_A - R_B, wrap(alpha_A - alpha_B)]
+    double dv[2] = { A->params[0] - B->params[0], norm_ang(A->params[1] - B->params[1]) };
+    double S[2][2] = {
+        { A->cov[0][0] + B->cov[0][0], A->cov[0][1] + B->cov[0][1] },
+        { A->cov[1][0] + B->cov[1][0], A->cov[1][1] + B->cov[1][1] }
+    };
+    double invS[2][2];
+    if (!invert2x2(S, invS)) return 1e12;
+    double tmp[2];
+    tmp[0] = invS[0][0]*dv[0] + invS[0][1]*dv[1];
+    tmp[1] = invS[1][0]*dv[0] + invS[1][1]*dv[1];
+    return dv[0]*tmp[0] + dv[1]*tmp[1];
+}
+static double chi2_circle(const MapLine *A, const MapLine *B) {
+    double dv[3] = { A->params[0]-B->params[0], A->params[1]-B->params[1], A->params[2]-B->params[2] };
+    double S[3][3];
+    for (int i=0;i<3;i++) for (int j=0;j<3;j++) S[i][j] = A->cov[i][j] + B->cov[i][j];
+    double invS[3][3];
+    if (!invert3x3(S, invS)) return 1e12;
+    double tmp[3]; mat3_mul_vec(invS, dv, tmp);
+    return dv[0]*tmp[0] + dv[1]*tmp[1] + dv[2]*tmp[2];
 }
 
-// --- 프레임 처리 루프 ---
-static void process_all_frames(int num_frames) {
-    Pose pose = {0.0, 0.0, 0.0}; // global pose (x,y,theta)
-    map_line_count = 0;
-    next_map_id = 1;
-
-    const double CHI2_THRESH = 5.991; // 95% for dof=2 (설정 가능, 추측입니다)
-
-    for (int f=0; f<num_frames; f++) {
-        printf("\n=== Frame %d ===\n", f);
-        DR d = sample_dr[f];
-        // integrate DR to update pose (assumption: DR describes motion since previous frame -> we first update pose)
-        // transform local delta to global: [dxg, dyg] = R(pose.theta) * [d.dx, d.dy]
-        double c = cos(pose.theta), s = sin(pose.theta);
-        double dxg = c * d.dx - s * d.dy;
-        double dyg = s * d.dx + c * d.dy;
-        pose.x += dxg;
-        pose.y += dyg;
-        pose.theta = normalize_angle(pose.theta + d.dh);
-
-        printf("Pose updated: x=%.3f y=%.3f theta=%.3f deg\n",
-               pose.x, pose.y, pose.theta * 180.0 / PI);
-
-        // For each detected lane in this frame: fit line in local frame -> transform to global -> merge
-        FrameObs *obs = &sample_frames[f];
-        for (int L=0; L<obs->NumOfLane; L++) {
-            LaneLineInfo *lli = &obs->lane_line_info_list[L];
-            if (lli->NumOfPoints < 2) continue;
-            LineParam local_lp;
-            local_lp.id = -1;
-            local_lp.count = 1;
-            // fit
-            double r_local, theta_local;
-            double cov_local[2][2];
-            int ok = fit_weighted_line_pca(lli, &r_local, &theta_local, cov_local);
-            if (!ok) continue;
-
-            local_lp.r = r_local;
-            local_lp.theta = theta_local;
-            local_lp.cov[0][0] = cov_local[0][0];
-            local_lp.cov[0][1] = cov_local[0][1];
-            local_lp.cov[1][0] = cov_local[1][0];
-            local_lp.cov[1][1] = cov_local[1][1];
-
-            // transform to global using updated pose
-            LineParam global_lp;
-            transform_line_to_global(&local_lp, &pose, &global_lp);
-
-            printf(" Detected lane %d local: r=%.3f theta=%.3fdeg | global: r=%.3f theta=%.3fdeg\n",
-                   L, local_lp.r, local_lp.theta*180.0/PI,
-                   global_lp.r, global_lp.theta*180.0/PI);
-
-            // merge into map
-            merge_into_map(&global_lp, CHI2_THRESH);
-        }
-
-        // print current map summary
-        printf(" Map lines after frame %d: count=%d\n", f, map_line_count);
-        for (int i=0;i<map_line_count;i++) {
-            LineParam *m = &map_lines[i];
-            printf("  id=%d cnt=%d  r=%.3f  theta=%.3fdeg  cov_rr=%.4e cov_tt=%.4e\n",
-                   m->id, m->count, m->r, m->theta*180.0/PI, m->cov[0][0], m->cov[1][1]);
-        }
+// info-form merge helpers
+static void merge_line_info(const MapLine *A, const MapLine *B, MapLine *out) {
+    double S1[2][2] = {{A->cov[0][0], A->cov[0][1]},{A->cov[1][0], A->cov[1][1]}};
+    double S2[2][2] = {{B->cov[0][0], B->cov[0][1]},{B->cov[1][0], B->cov[1][1]}};
+    double invS1[2][2], invS2[2][2];
+    if (!invert2x2(S1, invS1) || !invert2x2(S2, invS2)) {
+        // fallback average
+        *out = *A;
+        out->params[0] = 0.5*(A->params[0] + B->params[0]);
+        out->params[1] = norm_ang(0.5*(A->params[1] + B->params[1]));
+        out->cov[0][0] = 0.5*(A->cov[0][0] + B->cov[0][0]);
+        out->cov[0][1] = 0.0; out->cov[1][0] = 0.0;
+        out->cov[1][1] = 0.5*(A->cov[1][1] + B->cov[1][1]);
+        out->count = A->count + B->count;
+        out->x1 = 0.5*(A->x1 + B->x1); out->y1 = 0.5*(A->y1 + B->y1);
+        out->x2 = 0.5*(A->x2 + B->x2); out->y2 = 0.5*(A->y2 + B->y2);
+        return;
     }
+    double Info[2][2] = { {invS1[0][0] + invS2[0][0], invS1[0][1] + invS2[0][1]}, {invS1[1][0] + invS2[1][0], invS1[1][1] + invS2[1][1]}};
+    double covm[2][2];
+    if (!invert2x2(Info, covm)) {
+        *out = *A;
+        out->params[0] = 0.5*(A->params[0] + B->params[0]);
+        out->params[1] = norm_ang(0.5*(A->params[1] + B->params[1]));
+        out->cov[0][0] = 0.5*(A->cov[0][0] + B->cov[0][0]);
+        out->cov[1][1] = 0.5*(A->cov[1][1] + B->cov[1][1]);
+        out->count = A->count + B->count;
+        return;
+    }
+    double p1[2] = {A->params[0], A->params[1]};
+    double p2[2] = {B->params[0], B->params[1]};
+    double rhs[2] = {0,0}, tmpv[2];
+    // rhs = invS1*p1 + invS2*p2
+    tmpv[0] = invS1[0][0]*p1[0] + invS1[0][1]*p1[1]; tmpv[1] = invS1[1][0]*p1[0] + invS1[1][1]*p1[1];
+    rhs[0]+=tmpv[0]; rhs[1]+=tmpv[1];
+    tmpv[0] = invS2[0][0]*p2[0] + invS2[0][1]*p2[1]; tmpv[1] = invS2[1][0]*p2[0] + invS2[1][1]*p2[1];
+    rhs[0]+=tmpv[0]; rhs[1]+=tmpv[1];
+    // pmerged = covm * rhs
+    double pmerged[2];
+    pmerged[0] = covm[0][0]*rhs[0] + covm[0][1]*rhs[1];
+    pmerged[1] = covm[1][0]*rhs[0] + covm[1][1]*rhs[1];
+    *out = *A;
+    out->params[0] = pmerged[0];
+    out->params[1] = norm_ang(pmerged[1]);
+    out->cov[0][0] = covm[0][0]; out->cov[0][1] = covm[0][1]; out->cov[1][0] = covm[1][0]; out->cov[1][1] = covm[1][1];
+    out->count = A->count + B->count;
+    // endpoints merge: project endpoints of A,B onto merged axis and take extremes
+    double dirx = -sin(out->params[1]), diry = cos(out->params[1]);
+    double x0 = out->params[0] * cos(out->params[1]), y0 = out->params[0] * sin(out->params[1]);
+    double ptsx[4] = {A->x1, A->x2, B->x1, B->x2}, ptsy[4] = {A->y1, A->y2, B->y1, B->y2};
+    double mn = 1e12, mx = -1e12;
+    for (int i=0;i<4;i++){
+        double proj = (ptsx[i]-x0)*dirx + (ptsy[i]-y0)*diry;
+        if (proj < mn) mn = proj; if (proj > mx) mx = proj;
+    }
+    out->x1 = x0 + dirx*mn; out->y1 = y0 + diry*mn; out->x2 = x0 + dirx*mx; out->y2 = y0 + diry*mx;
 }
 
+static void merge_circle_info(const MapLine *A, const MapLine *B, MapLine *out) {
+    double S1[3][3], S2[3][3];
+    for (int i=0;i<3;i++) for (int j=0;j<3;j++){ S1[i][j]=A->cov[i][j]; S2[i][j]=B->cov[i][j]; }
+    double invS1[3][3], invS2[3][3];
+    if (!invert3x3(S1, invS1) || !invert3x3(S2, invS2)) {
+        // fallback average
+        *out = *A;
+        for (int i=0;i<3;i++) for (int j=0;j<3;j++) out->cov[i][j] = 0.5*(S1[i][j] + S2[i][j]);
+        out->params[0] = 0.5*(A->params[0] + B->params[0]);
+        out->params[1] = 0.5*(A->params[1] + B->params[1]);
+        out->params[2] = 0.5*(A->params[2] + B->params[2]);
+        out->count = A->count + B->count;
+        out->x1 = 0.5*(A->x1 + B->x1); out->y1 = 0.5*(A->y1 + B->y1);
+        out->x2 = 0.5*(A->x2 + B->x2); out->y2 = 0.5*(A->y2 + B->y2);
+        return;
+    }
+    double Info[3][3];
+    for (int i=0;i<3;i++) for (int j=0;j<3;j++) Info[i][j] = invS1[i][j] + invS2[i][j];
+    double covm[3][3];
+    if (!invert3x3(Info, covm)) {
+        *out = *A; out->count = A->count + B->count; return;
+    }
+    // rhs = invS1*p1 + invS2*p2
+    double p1[3] = {A->params[0], A->params[1], A->params[2]};
+    double p2[3] = {B->params[0], B->params[1], B->params[2]};
+    double rhs[3] = {0,0,0}, tmpv[3];
+    mat3_mul_vec(invS1, p1, tmpv); rhs[0]+=tmpv[0]; rhs[1]+=tmpv[1]; rhs[2]+=tmpv[2];
+    mat3_mul_vec(invS2, p2, tmpv); rhs[0]+=tmpv[0]; rhs[1]+=tmpv[1]; rhs[2]+=tmpv[2];
+    double pmerged[3]; mat3_mul_vec(covm, rhs, pmerged);
+    *out = *A;
+    out->params[0] = pmerged[0]; out->params[1] = pmerged[1]; out->params[2] = pmerged[2];
+    for (int i=0;i<3;i++) for (int j=0;j<3;j++) out->cov[i][j] = covm[i][j];
+    out->count = A->count + B->count;
+    // endpoints: take extremes of A/B endpoints projected onto radial angles around merged center
+    double a = out->params[0], b = out->params[1], r = out->params[2];
+    double angs[4];
+    for (int i=0;i<4;i++) angs[i] = atan2((i<2?A->y1:A->y2) - b, (i<2?A->x1:A->x2) - a); // rough but ok
+    // just set endpoints from A and B average for simplicity
+    out->x1 = 0.5*(A->x1 + B->x1); out->y1 = 0.5*(A->y1 + B->y1);
+    out->x2 = 0.5*(A->x2 + B->x2); out->y2 = 0.5*(A->y2 + B->y2);
+}
+
+// ----------------- AIC model selection -----------------
+// For LINE we use negloglik from Pfister M_of_R_A; for CIRCLE we computed negloglik in fit_circle_weighted.
+// AIC = 2*k + 2*M  (we use k = number of parameters)
+static double compute_AIC_line(int k_params, double negloglik) { return 2.0 * k_params + 2.0 * negloglik; }
+static double compute_AIC_circle(int k_params, double negloglik) { return 2.0 * k_params + 2.0 * negloglik; }
+
+// ----------------- Merge API -----------------
+// Merge processes one frame:
+//  - dr: vehicle delta (in previous ego-local coords) -> transform existing map to new ego-local frame
+//  - lanes: detected lane clusters in current ego-local frame (caller must supply measurements in current ego-local)
+//  - nlanes: number of LaneLineInfo
+//  - map/map_count/max_map: in/out map storage (always ego-local)
+static void Merge(const DR *dr, const LaneLineInfo lanes[], int nlanes, MapLine map[], int *map_count, int max_map) {
+    // 1) transform existing map to new ego-local frame
+    if (dr) transform_map_by_dr(map, *map_count, dr);
+
+    // 2) for each lane, fit both LINE and CIRCLE, compute neg-log-likelihood and AIC, choose model
+    for (int li=0; li<nlanes; ++li) {
+        const LaneLineInfo *L = &lanes[li];
+        if (L->NumOfPoints < 2) continue;
+
+        // Fit LINE
+        double Rlin, Alin, cov2[2][2], e1x_l,e1y_l,e2x_l,e2y_l, neglog_line;
+        int ok_line = fit_line_pfister_local(L, &Rlin, &Alin, cov2, &e1x_l,&e1y_l,&e2x_l,&e2y_l, &neglog_line);
+        double AIC_line = 1e99;
+        if (ok_line) {
+            AIC_line = compute_AIC_line(2, neglog_line); // k=2
+        }
+
+        // Fit CIRCLE
+        double a_c, b_c, r_c, cov3[3][3], neglog_circle, e1x_c,e1y_c,e2x_c,e2y_c;
+        int ok_circle = fit_circle_weighted(L, &a_c,&b_c,&r_c, cov3, &neglog_circle, &e1x_c,&e1y_c,&e2x_c,&e2y_c);
+        double AIC_circle = 1e99;
+        if (ok_circle) {
+            AIC_circle = compute_AIC_circle(3, neglog_circle); // k=3
+        }
+
+        // choose model by AIC (smaller better). If both failed, skip.
+        PrimitiveType chosen;
+        if (!ok_line && !ok_circle) continue;
+        if (ok_line && (!ok_circle || AIC_line <= AIC_circle)) chosen = PRIM_LINE;
+        else chosen = PRIM_CIRCLE;
+
+        // build candidate MapLine
+        MapLine cand; memset(&cand,0,sizeof(cand));
+        cand.count = 1;
+        if (chosen == PRIM_LINE) {
+            cand.type = PRIM_LINE;
+            cand.params[0] = Rlin; cand.params[1] = Alin; cand.params[2] = 0.0;
+            // fill cov 3x3 with top-left 2x2 for compatibility
+            for (int i=0;i<3;i++) for (int j=0;j<3;j++) cand.cov[i][j] = 0.0;
+            cand.cov[0][0] = cov2[0][0]; cand.cov[0][1] = cov2[0][1];
+            cand.cov[1][0] = cov2[1][0]; cand.cov[1][1] = cov2[1][1];
+            cand.x1 = e1x_l; cand.y1 = e1y_l; cand.x2 = e2x_l; cand.y2 = e2y_l;
+        } else {
+            cand.type = PRIM_CIRCLE;
+            cand.params[0] = a_c; cand.params[1] = b_c; cand.params[2] = r_c;
+            for (int i=0;i<3;i++) for (int j=0;j<3;j++) cand.cov[i][j] = cov3[i][j];
+            cand.x1 = e1x_c; cand.y1 = e1y_c; cand.x2 = e2x_c; cand.y2 = e2y_c;
+        }
+
+        // 3) merge candidate into map if matching same primitive found; else append new
+        double best_chi2 = 1e99; int best_idx = -1;
+        for (int m=0; m<*map_count; ++m) {
+            if (map[m].type != cand.type) continue;
+            double c2 = (cand.type == PRIM_LINE) ? chi2_line(&cand, &map[m]) : chi2_circle(&cand, &map[m]);
+            if (c2 < best_chi2) { best_chi2 = c2; best_idx = m; }
+        }
+        int do_merge = 0;
+        if (best_idx >= 0) {
+            if (cand.type == PRIM_LINE) do_merge = (best_chi2 < LINE_CHI2_THRESH);
+            else do_merge = (best_chi2 < CIRCLE_CHI2_THRESH);
+        }
+        if (do_merge && best_idx >= 0) {
+            MapLine merged;
+            if (cand.type == PRIM_LINE) merge_line_info(&map[best_idx], &cand, &merged);
+            else merge_circle_info(&map[best_idx], &cand, &merged);
+            merged.id = map[best_idx].id;
+            map[best_idx] = merged;
+        } else {
+            if (*map_count < max_map) {
+                cand.id = (*map_count) + 1;
+                map[(*map_count)++] = cand;
+            } else {
+                // map full: ignore
+            }
+        }
+    } // end lanes loop
+}
+
+// ----------------- Minimal example (define MERGE_EXAMPLE to compile example main) -----------------
+#ifdef MERGE_EXAMPLE
 int main() {
-    prepare_sample_frames();
-    // We set number of frames to 3 (as sample_dr and sample_frames prepared)
-    process_all_frames(3);
+    MapLine map[MAX_MAP]; int map_count = 0;
+    // Frame0: two straight lanes
+    LaneLineInfo lanes0[2];
+    lanes0[0].NumOfPoints = 3;
+    lanes0[0].pts[0][0]=10; lanes0[0].pts[0][1]=-3;
+    lanes0[0].pts[1][0]=10; lanes0[0].pts[1][1]=0;
+    lanes0[0].pts[2][0]=10; lanes0[0].pts[2][1]=3;
+    lanes0[1].NumOfPoints = 3;
+    lanes0[1].pts[0][0]=20; lanes0[1].pts[0][1]=-3;
+    lanes0[1].pts[1][0]=20; lanes0[1].pts[1][1]=0;
+    lanes0[1].pts[2][0]=20; lanes0[1].pts[2][1]=3;
+    DR dr0 = {0,0,0};
+    Merge(&dr0, lanes0, 2, map, &map_count, MAX_MAP);
+    printf("After frame0 map_count=%d\n", map_count);
+
+    // Frame1: vehicle moved +1m and sees approx same lanes (or slight curvature)
+    DR dr1 = {1.0, 0.0, 0.0};
+    LaneLineInfo lanes1[2];
+    lanes1[0].NumOfPoints = 3;
+    lanes1[0].pts[0][0]=9.05; lanes1[0].pts[0][1]=-3.1;
+    lanes1[0].pts[1][0]=8.95; lanes1[0].pts[1][1]=0.05;
+    lanes1[0].pts[2][0]=9.02; lanes1[0].pts[2][1]=3.0;
+    lanes1[1].NumOfPoints = 4;
+    lanes1[1].pts[0][0]=19.1; lanes1[1].pts[0][1]=-2.9;
+    lanes1[1].pts[1][0]=19.0; lanes1[1].pts[1][1]=0.1;
+    lanes1[1].pts[2][0]=19.02; lanes1[1].pts[2][1]=2.95;
+    lanes1[1].pts[3][0]=18.9; lanes1[1].pts[3][1]=3.0;
+    Merge(&dr1, lanes1, 2, map, &map_count, MAX_MAP);
+    printf("After frame1 map_count=%d\n", map_count);
+    for (int i=0;i<map_count;i++){
+        MapLine *m=&map[i];
+        if (m->type==PRIM_LINE) {
+            printf("Line id=%d R=%.3f alpha=%.3fdeg cnt=%d\n", m->id, m->params[0], m->params[1]*180.0/M_PI, m->count);
+        } else {
+            printf("Circle id=%d center=(%.3f,%.3f) r=%.3f cnt=%d\n", m->id, m->params[0], m->params[1], m->params[2], m->count);
+        }
+    }
     return 0;
 }
+#endif
