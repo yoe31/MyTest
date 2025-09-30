@@ -120,3 +120,66 @@ int main(int argc, char** argv) {
 
     return 0;
 }
+
+
+
+
+
+#include <opencv2/opencv.hpp>
+#include <iostream>
+
+using namespace cv;
+using namespace std;
+
+// Gray → RGB 변환 함수
+Mat grayToRGB(const Mat& gray, double a, double b, double c) {
+    CV_Assert(gray.type() == CV_8UC1);
+
+    Mat rgb(gray.size(), CV_8UC3);
+
+    // a+b+c 로 정규화
+    double sum = a + b + c;
+    double na = a / sum;
+    double nb = b / sum;
+    double nc = c / sum;
+
+    for (int y = 0; y < gray.rows; y++) {
+        for (int x = 0; x < gray.cols; x++) {
+            uchar g = gray.at<uchar>(y, x);
+
+            int R = static_cast<int>(g * na);
+            int G = static_cast<int>(g * nb);
+            int B = static_cast<int>(g * nc);
+
+            // 범위 제한
+            R = std::min(255, std::max(0, R));
+            G = std::min(255, std::max(0, G));
+            B = std::min(255, std::max(0, B));
+
+            rgb.at<Vec3b>(y, x) = Vec3b(B, G, R);  // OpenCV는 BGR 순서
+        }
+    }
+    return rgb;
+}
+
+int main() {
+    // Gray 이미지 읽기 (1280x576)
+    Mat gray = imread("gray.png", IMREAD_GRAYSCALE);
+    if (gray.empty()) {
+        cerr << "Gray image not found!" << endl;
+        return -1;
+    }
+
+    // 예시로 a,b,c 값 (원본 분석으로 얻은 값 넣기)
+    double a = 0.299, b = 0.587, c = 0.114; // 일반적인 OpenCV 변환 계수
+
+    // Gray → RGB 변환
+    Mat rgb = grayToRGB(gray, a, b, c);
+
+    // 결과 출력
+    imshow("Gray Image", gray);
+    imshow("Recovered RGB", rgb);
+    waitKey(0);
+
+    return 0;
+}
