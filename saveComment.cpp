@@ -7,8 +7,8 @@
 
 #define FONT_PATH "NanumGothic.ttf"
 static char inputText[256] = "";
-static bool showInputPopup = false;
-static bool needFocus = false;
+static bool showInputPopup = true;  // 시작 시 자동으로 팝업 표시
+static bool needFocus = true;
 
 void SaveTextToCSV(const char* text, const char* filename)
 {
@@ -31,7 +31,7 @@ int main()
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
 
-    GLFWwindow* window = glfwCreateWindow(800, 600, "Main GL Window", NULL, NULL);
+    GLFWwindow* window = glfwCreateWindow(800, 600, "ImGui CSV Saver (한글 자동 입력창)", NULL, NULL);
     if (!window) return 1;
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
@@ -39,10 +39,15 @@ int main()
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO(); (void)io;
+
     io.Fonts->AddFontFromFileTTF(FONT_PATH, 18.0f, NULL, io.Fonts->GetGlyphRangesKorean());
     ImGui::StyleColorsDark();
+
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init(glsl_version);
+
+    // 팝업을 미리 열기
+    ImGui::OpenPopup("텍스트 입력");
 
     while (!glfwWindowShouldClose(window))
     {
@@ -52,18 +57,13 @@ int main()
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        // 메인 윈도우 (계속 렌더링)
+        // 메인 윈도우 (계속 유지됨)
         ImGui::Begin("메인 윈도우");
         ImGui::Text("이 창은 계속 동작합니다.");
-        if (ImGui::Button("텍스트 입력창 열기"))
-        {
-            showInputPopup = true;
-            needFocus = true; // 포커스 필요 플래그
-            ImGui::OpenPopup("텍스트 입력");
-        }
+        ImGui::Text("텍스트 입력창은 자동으로 표시됩니다.");
         ImGui::End();
 
-        // 팝업 윈도우
+        // 팝업 윈도우 (자동 표시)
         if (showInputPopup)
         {
             ImGui::SetNextWindowSize(ImVec2(400, 150));
@@ -71,7 +71,7 @@ int main()
             {
                 ImGui::Text("CSV에 저장할 텍스트를 입력하세요:");
 
-                // 창이 처음 열릴 때 포커스 자동 설정
+                // 처음 열릴 때 자동 포커스
                 if (needFocus)
                 {
                     ImGui::SetKeyboardFocusHere();
@@ -80,9 +80,10 @@ int main()
 
                 ImGui::InputText("##input", inputText, IM_ARRAYSIZE(inputText), ImGuiInputTextFlags_AutoSelectAll);
 
+                // Save 버튼
                 if (ImGui::Button("Save"))
                 {
-                    // 한글 조합 완료를 위해 이벤트 플러시
+                    // 한글 조합 완성 강제
                     glfwFocusWindow(window);
                     glfwPollEvents();
 
@@ -93,6 +94,8 @@ int main()
                 }
 
                 ImGui::SameLine();
+
+                // Cancel 버튼
                 if (ImGui::Button("Cancel"))
                 {
                     inputText[0] = '\0';
@@ -101,6 +104,11 @@ int main()
                 }
 
                 ImGui::EndPopup();
+            }
+            else
+            {
+                // 팝업이 닫혔으면 프로그램 종료
+                glfwSetWindowShouldClose(window, GLFW_TRUE);
             }
         }
 
