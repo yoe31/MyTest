@@ -1,92 +1,103 @@
-#include <GLFW/glfw3.h>
-#include <imgui.h>
-#include <imgui_impl_glfw.h>
-#include <imgui_impl_opengl3.h>
+#include "imgui.h"
+#include "imgui_impl_glfw.h"
+#include "imgui_impl_opengl3.h"
+#include <stdio.h>
+#include <GLFW/glfw3.h> // Include glfw3.h after our OpenGL definitions
 #include <iostream>
-#include <fstream>
-#include <ctime>
 
-bool show_input_window = false;
-char input_buffer[256] = {0};
+// UTF-8 한글 폰트 로드용 경로 설정
+#define FONT_PATH "NanumGothic.ttf"
 
-std::string getTodayCSV() {
-    time_t t = time(nullptr);
-    struct tm *now = localtime(&t);
-    char filename[64];
-    strftime(filename, sizeof(filename), "%Y%m%d.csv", now);
-    return std::string(filename);
-}
+// 텍스트 버퍼 크기
+static char inputText[256] = "";
 
-void saveToCSV(const std::string &text) {
-    std::string filename = getTodayCSV();
-    std::ofstream file(filename, std::ios::app);
-    if (file.is_open()) {
-        file << text << "\n";
-        file.close();
-    } else {
-        std::cerr << "파일을 열 수 없습니다: " << filename << std::endl;
+void SaveTextToCSV(const char* text, const char* filename)
+{
+    FILE* file = fopen(filename, "a");
+    if (file)
+    {
+        fprintf(file, "\"%s\"\n", text);
+        fclose(file);
+    }
+    else
+    {
+        std::cerr << "파일 열기 실패: " << filename << std::endl;
     }
 }
 
-void key_callback(GLFWwindow *window, int key, int scancode, int action, int mods) {
-    if (action == GLFW_PRESS && key == GLFW_KEY_C && (mods & GLFW_MOD_CONTROL)) {
-        show_input_window = true;
-    }
-}
+int main(int, char**)
+{
+    // GLFW 초기화
+    if (!glfwInit())
+        return 1;
 
-int main() {
-    if (!glfwInit()) return -1;
+    // OpenGL 버전 설정
+    const char* glsl_version = "#version 130";
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
 
-    GLFWwindow *window = glfwCreateWindow(800, 600, "OpenGL CSV Input Example", NULL, NULL);
-    if (!window) {
-        glfwTerminate();
-        return -1;
-    }
+    // 윈도우 생성
+    GLFWwindow* window = glfwCreateWindow(600, 200, "ImGui CSV Saver (한글 지원)", NULL, NULL);
+    if (window == NULL)
+        return 1;
     glfwMakeContextCurrent(window);
-    glfwSetKeyCallback(window, key_callback);
+    glfwSwapInterval(1); // Enable vsync
 
     // ImGui 초기화
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
-    ImGuiIO &io = ImGui::GetIO();
-    (void)io;
+    ImGuiIO& io = ImGui::GetIO(); (void)io;
 
+    // 한글 폰트 추가 (UTF-8)
+    io.Fonts->AddFontFromFileTTF(FONT_PATH, 18.0f, NULL, io.Fonts->GetGlyphRangesKorean());
+
+    ImGui::StyleColorsDark();
     ImGui_ImplGlfw_InitForOpenGL(window, true);
-    ImGui_ImplOpenGL3_Init("#version 130");
+    ImGui_ImplOpenGL3_Init(glsl_version);
 
-    while (!glfwWindowShouldClose(window)) {
+    // 메인 루프
+    while (!glfwWindowShouldClose(window))
+    {
         glfwPollEvents();
 
+        // 새 프레임 시작
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        // 입력 창 표시
-        if (show_input_window) {
-            ImGui::Begin("문자열 입력", &show_input_window);
-            ImGui::InputText("입력", input_buffer, IM_ARRAYSIZE(input_buffer));
+        ImGui::Begin("텍스트 입력 및 저장");
 
-            if (ImGui::Button("Save")) {
-                saveToCSV(input_buffer);
-                input_buffer[0] = '\0'; // 초기화
-                show_input_window = false;
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Cancel")) {
-                show_input_window = false;
-            }
-            ImGui::End();
+        ImGui::Text("CSV에 저장할 텍스트를 입력하세요:");
+        ImGui::InputText("##input", inputText, IM_ARRAYSIZE(inputText));
+
+        // Save 버튼
+        if (ImGui::Button("Save") || (ImGui::IsKeyDown(ImGuiKey_LeftCtrl) && ImGui::IsKeyPressed(ImGuiKey_S)))
+        {
+            SaveTextToCSV(inputText, "output.csv");
+            inputText[0] = '\0'; // 입력창 초기화
         }
 
-        // 화면 그리기
-        glClear(GL_COLOR_BUFFER_BIT);
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel"))
+        {
+            inputText[0] = '\0';
+        }
+
+        ImGui::End();
+
+        // 렌더링
         ImGui::Render();
+        int display_w, display_h;
+        glfwGetFramebufferSize(window, &display_w, &display_h);
+        glViewport(0, 0, display_w, display_h);
+        glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
         glfwSwapBuffers(window);
     }
 
-    // 정리
+    // 종료 처리
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
