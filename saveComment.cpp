@@ -8,6 +8,7 @@
 #define FONT_PATH "NanumGothic.ttf"
 static char inputText[256] = "";
 static bool showInputPopup = false;
+static bool needFocus = false;
 
 void SaveTextToCSV(const char* text, const char* filename)
 {
@@ -39,7 +40,6 @@ int main()
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO(); (void)io;
     io.Fonts->AddFontFromFileTTF(FONT_PATH, 18.0f, NULL, io.Fonts->GetGlyphRangesKorean());
-
     ImGui::StyleColorsDark();
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init(glsl_version);
@@ -52,27 +52,40 @@ int main()
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        // 메인 윈도우 내용 (계속 돌아감)
+        // 메인 윈도우 (계속 렌더링)
         ImGui::Begin("메인 윈도우");
-        ImGui::Text("이 창은 계속 돌아갑니다.");
+        ImGui::Text("이 창은 계속 동작합니다.");
         if (ImGui::Button("텍스트 입력창 열기"))
         {
             showInputPopup = true;
+            needFocus = true; // 포커스 필요 플래그
             ImGui::OpenPopup("텍스트 입력");
         }
         ImGui::End();
 
-        // 팝업 윈도우 (모달)
+        // 팝업 윈도우
         if (showInputPopup)
         {
             ImGui::SetNextWindowSize(ImVec2(400, 150));
             if (ImGui::BeginPopupModal("텍스트 입력", NULL, ImGuiWindowFlags_AlwaysAutoResize))
             {
                 ImGui::Text("CSV에 저장할 텍스트를 입력하세요:");
+
+                // 창이 처음 열릴 때 포커스 자동 설정
+                if (needFocus)
+                {
+                    ImGui::SetKeyboardFocusHere();
+                    needFocus = false;
+                }
+
                 ImGui::InputText("##input", inputText, IM_ARRAYSIZE(inputText), ImGuiInputTextFlags_AutoSelectAll);
 
                 if (ImGui::Button("Save"))
                 {
+                    // 한글 조합 완료를 위해 이벤트 플러시
+                    glfwFocusWindow(window);
+                    glfwPollEvents();
+
                     SaveTextToCSV(inputText, "output.csv");
                     inputText[0] = '\0';
                     showInputPopup = false;
