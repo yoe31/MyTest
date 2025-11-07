@@ -1,185 +1,192 @@
-// estimate_rgb2gray_coeff.cpp
-// 컴파일 예: g++ -std=c++17 estimate_rgb2gray_coeff.cpp `pkg-config --cflags --libs opencv4` -O2 -o estimate_rgb2gray_coeff
+// lateral_distance.c
+// Compile: gcc -O2 -o lateral_distance lateral_distance.c -lm
+// Run: ./lateral_distance
 
-#include <opencv2/opencv.hpp>
-#include <iostream>
-#include <vector>
-#include <cmath>
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
 
-int main(int argc, char** argv) {
-    if (argc < 3) {
-        std::cerr << "Usage: " << argv[0] << " <original_rgb.png> <gray.png> [stride]\n";
-        std::cerr << "  stride: (optional) 샘플링 간격. 기본값 5 (속도/정확도 균형)\n";
-        return -1;
+typedef struct {
+    double x;
+    double y;
+} Point;
+
+// result for each query point
+typedef struct {
+    double signed_dist; // positive => left of segment direction, negative => right
+    int seg_idx;        // index of segment in B that was closest (0..M-2), -1 if none
+    Point proj;         // projection point on that segment (or closest endpoint)
+} LateralResult;
+
+// compute squared distance between two points
+static double dist2(const Point *a, const Point *b) {
+    double dx = a->x - b->x;
+    double dy = a->y - b->y;
+    return dx*dx + dy*dy;
+}
+
+// dot product
+static double dot(double ax, double ay, double bx, double by) {
+    return ax*bx + ay*by;
+}
+
+// cross product z component (2D)
+static double cross(double ax, double ay, double bx, double by) {
+    return ax*by - ay*bx;
+}
+
+// project point p onto segment s0->s1
+// returns projection point in "proj", and t parameter (0..1 if within segment)
+// if t<0 or t>1 projection is outside — proj will be endpoint (s0 or s1)
+static double project_point_to_segment(const Point *p, const Point *s0, const Point *s1, Point *proj) {
+    double vx = s1->x - s0->x;
+    double vy = s1->y - s0->y;
+    double wx = p->x - s0->x;
+    double wy = p->y - s0->y;
+    double vlen2 = vx*vx + vy*vy;
+    if (vlen2 == 0.0) {
+        // segment degenerate -> treat as s0
+        proj->x = s0->x;
+        proj->y = s0->y;
+        return 0.0;
     }
-
-    std::string rgb_path = argv[1];
-    std::string gray_path = argv[2];
-    int stride = 5;
-    if (argc >= 4) stride = std::max(1, std::atoi(argv[3]));
-
-    cv::Mat img_rgb = cv::imread(rgb_path, cv::IMREAD_COLOR);       // BGR
-    cv::Mat img_gray = cv::imread(gray_path, cv::IMREAD_GRAYSCALE); // single channel
-
-    if (img_rgb.empty() || img_gray.empty()) {
-        std::cerr << "이미지를 불러올 수 없습니다. 경로를 확인하세요.\n";
-        return -1;
+    double t = dot(wx, wy, vx, vy) / vlen2;
+    if (t <= 0.0) {
+        proj->x = s0->x;
+        proj->y = s0->y;
+    } else if (t >= 1.0) {
+        proj->x = s1->x;
+        proj->y = s1->y;
+    } else {
+        proj->x = s0->x + t * vx;
+        proj->y = s0->y + t * vy;
     }
+    return t;
+}
 
-    int gw = img_gray.cols;
-    int gh = img_gray.rows;
+// compute signed lateral distance from point p to segment s0->s1
+// positive if p is to the left of segment direction s0->s1
+static double signed_distance_point_to_segment(const Point *p, const Point *s0, const Point *s1, Point *proj_out) {
+    Point proj;
+    double t = project_point_to_segment(p, s0, s1, &proj);
+    if (proj_out) *proj_out = proj;
+    double dx = p->x - proj.x;
+    double dy = p->y - proj.y;
+    double dist = sqrt(dx*dx + dy*dy);
 
-    // 원본이 작으면 종료
-    if (img_rgb.cols < gw || img_rgb.rows < gh) {
-        std::cerr << "원본 RGB 이미지가 gray 이미지보다 작습니다. 원본 크기: "
-                  << img_rgb.cols << "x" << img_rgb.rows << ", gray 크기: "
-                  << gw << "x" << gh << "\n";
-        return -1;
-    }
+    // determine sign: use cross product of segment direction and (p - proj).
+    // segment direction:
+    double sx = s1->x - s0->x;
+    double sy = s1->y - s0->y;
+    double c = cross(sx, sy, dx, dy);
+    // If c > 0 => left, c < 0 => right.
+    if (c > 0.0) return dist;
+    if (c < 0.0) return -dist;
+    return 0.0;
+}
 
-    // 잘라내기 설정: 밑부분을 잘라서(아래를 제거) 상단 gh행을 보존
-    // 만약 '하단을 보존하고 상단을 잘라서' 하고 싶으면 keepBottom = true로 바꾸세요.
-    bool keepBottom = false;
-    int crop_x = (img_rgb.cols - gw) / 2; // 가로는 중앙 크롭
-    int crop_y = keepBottom ? (img_rgb.rows - gh) : 0; // keepBottom==false면 top(0)부터 gh행을 취함
+// For each point in A (N points), find nearest segment in polyline B (M points => M-1 segments),
+// compute signed lateral distance and fill results array (length N).
+// Returns 0 on success, non-zero on invalid input.
+int compute_lateral_differences(
+    const Point *A, int N,
+    const Point *B, int M,
+    LateralResult *out_results // must be allocated with size >= N
+) {
+    if (!A || !B || !out_results) return -1;
+    if (N <= 0 || M <= 1) return -2;
 
-    cv::Rect roi(crop_x, crop_y, gw, gh);
-    cv::Mat rgb_crop = img_rgb(roi).clone(); // 잘린 영역 (BGR)
+    for (int i = 0; i < N; ++i) {
+        const Point *p = &A[i];
+        double best_d2 = 1e300;
+        int best_seg = -1;
+        Point best_proj = {0.0, 0.0};
+        double best_signed = 0.0;
 
-    // 샘플링으로 메모리/속도 조절
-    std::vector<cv::Vec3d> samplesRGB;
-    std::vector<double> samplesGray;
-    for (int r = 0; r < gh; r += stride) {
-        for (int c = 0; c < gw; c += stride) {
-            cv::Vec3b bgr = rgb_crop.at<cv::Vec3b>(r, c);
-            double R = static_cast<double>(bgr[2]);
-            double G = static_cast<double>(bgr[1]);
-            double B = static_cast<double>(bgr[0]);
-            double gval = static_cast<double>(img_gray.at<uchar>(r, c));
-            samplesRGB.emplace_back(R, G, B);
-            samplesGray.push_back(gval);
+        // check all segments in B
+        for (int s = 0; s < M - 1; ++s) {
+            Point proj;
+            project_point_to_segment(p, &B[s], &B[s+1], &proj);
+            double d2 = dist2(p, &proj);
+            if (d2 < best_d2) {
+                best_d2 = d2;
+                best_seg = s;
+                best_proj = proj;
+            }
+        }
+        if (best_seg >= 0) {
+            double sd = signed_distance_point_to_segment(p, &B[best_seg], &B[best_seg+1], &best_proj);
+            out_results[i].signed_dist = sd;
+            out_results[i].seg_idx = best_seg;
+            out_results[i].proj = best_proj;
+        } else {
+            // fallback (shouldn't happen if M>1)
+            out_results[i].signed_dist = 0.0;
+            out_results[i].seg_idx = -1;
+            out_results[i].proj = *p;
         }
     }
-
-    int N = static_cast<int>(samplesGray.size());
-    if (N < 3) {
-        std::cerr << "샘플 수가 너무 적습니다.\n";
-        return -1;
-    }
-
-    // A (Nx3), y (Nx1) - double
-    cv::Mat A(N, 3, CV_64F);
-    cv::Mat y(N, 1, CV_64F);
-    for (int i = 0; i < N; ++i) {
-        A.at<double>(i, 0) = samplesRGB[i][0]; // R
-        A.at<double>(i, 1) = samplesRGB[i][1]; // G
-        A.at<double>(i, 2) = samplesRGB[i][2]; // B
-        y.at<double>(i, 0) = samplesGray[i];
-    }
-
-    cv::Mat coeff; // 3x1
-    bool solved = cv::solve(A, y, coeff, cv::DECOMP_NORMAL); // normal equations (least squares)
-    if (!solved) {
-        std::cerr << "선형 시스템 해를 구할 수 없습니다.\n";
-        return -1;
-    }
-
-    double a = coeff.at<double>(0, 0);
-    double b = coeff.at<double>(1, 0);
-    double c = coeff.at<double>(2, 0);
-
-    // RMS error 계산 (샘플)
-    double sse = 0.0;
-    for (int i = 0; i < N; ++i) {
-        double pred = a * samplesRGB[i][0] + b * samplesRGB[i][1] + c * samplesRGB[i][2];
-        double diff = pred - samplesGray[i];
-        sse += diff * diff;
-    }
-    double rmse = std::sqrt(sse / N);
-
-    std::cout << "추정된 변환 식 (Gray ≈ a*R + b*G + c*B):\n";
-    std::cout << "  a (R coeff) = " << a << "\n";
-    std::cout << "  b (G coeff) = " << b << "\n";
-    std::cout << "  c (B coeff) = " << c << "\n";
-    std::cout << "샘플 기반 RMSE = " << rmse << " (0..255 스케일)\n";
-
-    // 예측 그레이 이미지 생성 및 저장 (검증용)
-    cv::Mat pred_gray(gh, gw, CV_8U);
-    for (int r = 0; r < gh; ++r) {
-        for (int c = 0; c < gw; ++c) {
-            cv::Vec3b bgr = rgb_crop.at<cv::Vec3b>(r, c);
-            double val = a * bgr[2] + b * bgr[1] + c * bgr[0]; // R,G,B 순
-            val = std::min(255.0, std::max(0.0, val));
-            pred_gray.at<uchar>(r, c) = static_cast<uchar>(std::round(val));
-        }
-    }
-
-    cv::imwrite("rgb_cropped.png", rgb_crop);
-    cv::imwrite("pred_gray.png", pred_gray);
-    std::cout << "검증 이미지 저장: rgb_cropped.png, pred_gray.png\n";
-
     return 0;
 }
 
-
-
-
-
-#include <opencv2/opencv.hpp>
-#include <iostream>
-
-using namespace cv;
-using namespace std;
-
-// Gray → RGB 변환 함수
-Mat grayToRGB(const Mat& gray, double a, double b, double c) {
-    CV_Assert(gray.type() == CV_8UC1);
-
-    Mat rgb(gray.size(), CV_8UC3);
-
-    // a+b+c 로 정규화
-    double sum = a + b + c;
-    double na = a / sum;
-    double nb = b / sum;
-    double nc = c / sum;
-
-    for (int y = 0; y < gray.rows; y++) {
-        for (int x = 0; x < gray.cols; x++) {
-            uchar g = gray.at<uchar>(y, x);
-
-            int R = static_cast<int>(g * na);
-            int G = static_cast<int>(g * nb);
-            int B = static_cast<int>(g * nc);
-
-            // 범위 제한
-            R = std::min(255, std::max(0, R));
-            G = std::min(255, std::max(0, G));
-            B = std::min(255, std::max(0, B));
-
-            rgb.at<Vec3b>(y, x) = Vec3b(B, G, R);  // OpenCV는 BGR 순서
-        }
+// helper to compute summary stats
+void compute_stats(const LateralResult *res, int N, double *mean, double *rms, double *maxabs) {
+    double sum = 0.0;
+    double sqsum = 0.0;
+    double mabs = 0.0;
+    for (int i = 0; i < N; ++i) {
+        double v = res[i].signed_dist;
+        sum += v;
+        sqsum += v*v;
+        double ab = fabs(v);
+        if (ab > mabs) mabs = ab;
     }
-    return rgb;
+    *mean = sum / N;
+    *rms = sqrt(sqsum / N);
+    *maxabs = mabs;
 }
 
-int main() {
-    // Gray 이미지 읽기 (1280x576)
-    Mat gray = imread("gray.png", IMREAD_GRAYSCALE);
-    if (gray.empty()) {
-        cerr << "Gray image not found!" << endl;
-        return -1;
+// simple demo / test
+int main(void) {
+    // Example: polyline A (N=5)
+    Point A[] = {
+        {0.0, 0.0},
+        {10.0, 0.5},
+        {20.0, 1.0},
+        {30.0, 1.5},
+        {40.0, 2.0}
+    };
+    int N = sizeof(A)/sizeof(A[0]);
+
+    // Example: polyline B (M=4) - roughly parallel to A but offset to left by 1.0
+    Point B[] = {
+        {0.0, 1.0},
+        {20.0, 1.5},
+        {40.0, 2.0},
+        {60.0, 2.5}
+    };
+    int M = sizeof(B)/sizeof(B[0]);
+
+    LateralResult *res = (LateralResult*)malloc(sizeof(LateralResult) * N);
+    if (!res) { fprintf(stderr, "malloc failed\n"); return 1; }
+
+    int rc = compute_lateral_differences(A, N, B, M, res);
+    if (rc != 0) {
+        fprintf(stderr, "compute failed: %d\n", rc);
+        free(res);
+        return 1;
     }
 
-    // 예시로 a,b,c 값 (원본 분석으로 얻은 값 넣기)
-    double a = 0.299, b = 0.587, c = 0.114; // 일반적인 OpenCV 변환 계수
+    printf("point_idx\tAx\tAy\tsigned_lat_dist\tseg_idx\tproj_x\tproj_y\n");
+    for (int i = 0; i < N; ++i) {
+        printf("%d\t\t%.3f\t%.3f\t%.6f\t\t%d\t%.3f\t%.3f\n",
+            i, A[i].x, A[i].y, res[i].signed_dist, res[i].seg_idx, res[i].proj.x, res[i].proj.y);
+    }
 
-    // Gray → RGB 변환
-    Mat rgb = grayToRGB(gray, a, b, c);
+    double mean, rms, maxabs;
+    compute_stats(res, N, &mean, &rms, &maxabs);
+    printf("\nSummary: mean=%.6f, rms=%.6f, maxabs=%.6f\n", mean, rms, maxabs);
 
-    // 결과 출력
-    imshow("Gray Image", gray);
-    imshow("Recovered RGB", rgb);
-    waitKey(0);
-
+    free(res);
     return 0;
 }
