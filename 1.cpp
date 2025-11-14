@@ -1,9 +1,8 @@
-void drawSpeedBumpDiagonal() {
-    int steps = 200;   // 사각형을 촘촘히 샘플링 (대각선 패턴 용)
-    float angle = 45.0f * 3.141592f / 180.0f;
-
-    float pattern = patternSize;  // 패턴 간격
-
+void drawSpeedBumpDiagonal() 
+{
+    int steps = 200;                 // 해상도
+    float patternSize = 0.1f;        // 패턴 1개 폭 (현실 ~10cm)
+    
     for (int i = 0; i < steps; i++) {
         for (int j = 0; j < steps; j++) {
 
@@ -12,7 +11,7 @@ void drawSpeedBumpDiagonal() {
             float u2 = (float)(i+1) / steps;
             float v2 = (float)(j+1) / steps;
 
-            // UV → 실제 사각형 좌표 보간
+            // UV → 월드좌표 (bilinear)
             Point p1 = {
                 quad[0].x*(1-u1)*(1-v1) + quad[1].x*u1*(1-v1) + quad[3].x*(1-u1)*v1 + quad[2].x*u1*v1,
                 quad[0].y*(1-u1)*(1-v1) + quad[1].y*u1*(1-v1) + quad[3].y*(1-u1)*v1 + quad[2].y*u1*v1
@@ -30,11 +29,17 @@ void drawSpeedBumpDiagonal() {
                 quad[0].y*(1-u1)*(1-v2) + quad[1].y*u1*(1-v2) + quad[3].y*(1-u1)*v2 + quad[2].y*u1*v2
             };
 
-            float stripeValue = (u1 + v1) / pattern;
-            int stripeIndex = ((int)floorf(stripeValue)) & 1;
+            // 45° 사선 방향 거리
+            float d = u1 + v1;
 
-            if (stripeIndex == 0) glColor3f(1.0f, 0.9f, 0.6f);   // 흰색
-            else                  glColor3f(1.0f, 0.6f, 0.1f);   // 주황색
+            // 패턴 내 위치 (0~1)
+            float local = fmodf(d, patternSize) / patternSize;
+
+            // ★ 정확한 과속방지턱 패턴: 하나의 사선 내 색 두 개(흰/주)
+            if (local < 0.5f)
+                glColor3f(1.0f, 1.0f, 1.0f);      // 흰색
+            else
+                glColor3f(1.0f, 0.6f, 0.1f);      // 주황색
 
             glBegin(GL_QUADS);
                 glVertex2f(p1.x, p1.y);
